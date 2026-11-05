@@ -107,6 +107,8 @@ Na validação incremental, variação no `total` não deve, isoladamente, acion
 
 Comparar identidade e data antes da validação temporal. Um ID confirmado na referência congelada com `added_at` diferente, inclusive quando a data anterior é nula, representa uma atualização do mesmo item. Registrar a nova data candidata, reiniciar a contagem de páginas conhecidas e continuar a busca. Essa data mutável fica fora da comparação temporal entre vizinhos e não substitui `previous_added_at` no checkpoint. A publicação continua atômica por coleção, incluindo após interrupção e retomada. Registrar a política como `descending_except_date_updates` em `ordering_observed`.
 
+Na retomada, reconstruir a última referência temporal pela menor data das observações já gravadas que não sejam atualizações de data de IDs confirmados. Essas observações seguem a ordem decrescente verificada pela coleta. Isso evita herdar de versões anteriores um `previous_added_at` baseado em data mutável, sem refazer chamadas de dados nem descartar o progresso.
+
 Se a ordem dos demais itens observados deixar de ser compatível com adições recentes no início, ou os dados não permitirem avaliar as fronteiras, publicar apenas metadados de catálogo e pausar a descoberta com cobertura inconclusiva. Informar a necessidade de revisão ou reconciliação explícita. Não certificar completude nem consumir a biblioteca inteira como fallback. IDs repetidos e mudanças nas assinaturas das páginas continuam invalidando a janela, mesmo quando a data de um ID foi atualizada.
 
 ## 5. Publicação dos estados

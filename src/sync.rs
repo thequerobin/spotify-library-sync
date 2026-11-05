@@ -291,6 +291,16 @@ async fn incremental_collection<A: Api>(
     let mut ready = scope.get::<String, _>("state") == "ready";
     let mut head_validated = false;
     if pages > 0 {
+        // Older versions could checkpoint an updated date as the last observed
+        // date. Rebuild the reference from committed, ordered observations that
+        // are not updates, so existing paused jobs can resume without a restart.
+        previous = sqlx::query_scalar(
+            "SELECT MIN(seen.saved_at) FROM sync_seen_item seen LEFT JOIN sync_baseline_item baseline ON baseline.job_id=seen.job_id AND baseline.collection=seen.item_type AND baseline.item_id=seen.item_id WHERE seen.job_id=? AND seen.item_type=? AND (baseline.item_id IS NULL OR baseline.saved_at=seen.saved_at)",
+        )
+        .bind(job)
+        .bind(kind)
+        .fetch_one(&mut *db)
+        .await?;
         let page: Page =
             serde_json::from_value(budget.get(db, api, job, kind, endpoint, 0).await?)?;
         page.validate(0, None)?;

@@ -295,6 +295,12 @@ async fn changed_date_at_page_boundary_survives_interruption_and_resume() -> Res
         .fetch_one(&mut db)
         .await?;
     assert_eq!(date, OLD, "an unfinished collection must not publish dates");
+    // Simulate a checkpoint written by the previous version, which used the
+    // updated date of the last item as its ordering reference.
+    sqlx::query("UPDATE sync_scope SET previous_added_at=? WHERE collection='track'")
+        .bind(older)
+        .execute(&mut db)
+        .await?;
     db.close().await?;
 
     db = database::open(&dir.path().join("db.sqlite")).await?;
