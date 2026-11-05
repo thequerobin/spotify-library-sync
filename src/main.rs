@@ -629,6 +629,14 @@ async fn run_playlist(
     }
     Ok(())
 }
+fn configured_discography_options(
+    config: &Config,
+    mut options: discography::Options,
+) -> discography::Options {
+    options.request_budget = options.request_budget.or(config.discography_request_budget);
+    options
+}
+
 async fn run_discography(
     db: &mut sqlx::SqliteConnection,
     config: &Config,
@@ -641,6 +649,7 @@ async fn run_discography(
     if kind == "sync" && !auth.can_read_followed() {
         bail!("Autorize a leitura de artistas seguidos com spotify-sync login --discography; depois repita este comando");
     }
+    let options = configured_discography_options(config, options);
     let job = discography::prepare(db, resume, kind, options).await?;
     let mut api = Spotify::new(auth, config.request_interval_ms)?;
     let result = tokio::select! {
@@ -696,5 +705,60 @@ async fn main() {
     if let Err(error) = result {
         eprintln!("\n{}\n", error_message(&error));
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn config_budget_is_used_without_overriding_explicit_options() {
+        let cli = Cli::try_parse_from([
+            "spotify-sync",
+            "--discography-request-budget",
+            "750",
+            "status",
+        ])
+        .unwrap();
+        let options = configured_discography_options(&cli.config, discography::Options::default());
+        assert_eq!(options.request_budget, Some(750));
+        let explicit = discography::Options {
+            request_budget: Some(400),
+            ..discography::Options::default()
+        };
+        let options = configured_discography_options(&cli.config, explicit);
+        assert_eq!(options.request_budget, Some(400));
+        let mut config = cli.config;
+        config.discography_request_budget = None;
+        let options = configured_discography_options(&config, discography::Options::default());
+        assert_eq!(options.request_budget, None);
+    }
+
+    #[test]
+    fn cli_budget_overrides_config_for_sync_tracks_and_resume() {
+        for command in ["sync", "tracks"] {
+            let cli = Cli::try_parse_from([
+                "spotify-sync",
+                "--discography-request-budget",
+                "750",
+                "discography",
+                command,
+                "--resume",
+                "--request-budget",
+                "400",
+            ])
+            .unwrap();
+            let options = match cli.command.unwrap() {
+                Command::Discography {
+                    command:
+                        DiscographyCommand::Sync { options, .. }
+                        | DiscographyCommand::Tracks { options, .. },
+                } => options,
+                _ => panic!("unexpected command"),
+            };
+            let options = configured_discography_options(&cli.config, options);
+            assert_eq!(options.request_budget, Some(400));
+        }
     }
 }

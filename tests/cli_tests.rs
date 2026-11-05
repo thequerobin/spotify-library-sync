@@ -283,3 +283,39 @@ async fn command_uses_system_timezone_in_child_process() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn dotenv_discography_budget_is_validated_for_menu_and_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("budget.db");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_spotify-sync"))
+            .current_dir(dir.path())
+            .arg("--database")
+            .arg(&path)
+            .args(args)
+            .env_remove("SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET")
+            .output()
+            .unwrap()
+    };
+    for value in ["4", "10001", "abc", "-1"] {
+        let contents = format!("SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET={value}\n");
+        std::fs::write(dir.path().join(".env"), contents).unwrap();
+        for args in [&["status"][..], &[][..]] {
+            let output = run(args);
+            assert!(!output.status.success());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("discography-request-budget"));
+        }
+        assert!(!path.exists());
+    }
+    for value in ["5", "750", "10000"] {
+        let contents = format!("SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET={value}\n");
+        std::fs::write(dir.path().join(".env"), contents).unwrap();
+        assert!(run(&["status"]).status.success());
+        let output = run(&[]);
+        assert!(output.status.success());
+        let menu = String::from_utf8_lossy(&output.stdout);
+        assert!(menu.contains("4. Buscar discografias"));
+    }
+}

@@ -333,3 +333,25 @@ A listagem de lançamentos usa o offset de `next` informado pelo Spotify, valida
 Na retomada (opção 5), a página anterior é conferida e seu cursor é reaplicado, inclusive para checkpoints antigos calculados pela quantidade de itens. Artistas já concluídos são preservados. Mudanças de total, fim prematuro e cursores inválidos continuam pausando a coleta e agora incluem o artista, offsets, quantidade, total e `next` no diagnóstico. Somente os offsets são utilizados: URLs retornadas pela API nunca recebem chamadas autenticadas diretamente.
 
 Referência: [paginação dos álbuns de um artista](https://developer.spotify.com/documentation/web-api/reference/get-an-artists-albums).
+
+### Configurar o orçamento de requisições da discografia
+
+No `.env`, configure, por exemplo:
+
+```dotenv
+SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET=1000
+```
+
+São aceitos inteiros de 5 a 10000. Feche e abra o programa após editar o arquivo.
+Vale para as opções 4 e 5 do menu e para `discography sync` e `discography tracks`,
+inclusive com `--resume`, sem perguntas adicionais no menu.
+
+Prioridade: `--request-budget` do comando > `SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET` >
+limite salvo no job ao retomar > padrão 200 em novos jobs. A variável configurada
+substitui o orçamento salvo na próxima retomada. Sem ela, a retomada conserva o
+limite do job. Variáveis do ambiente do sistema têm prioridade sobre o `.env`,
+conforme o carregamento existente.
+
+O orçamento conta tentativas HTTP por execução, não artistas. Ao esgotá-lo,
+o programa pausa e preserva os checkpoints. Ele não altera o intervalo entre
+chamadas nem o cooldown do Spotify.

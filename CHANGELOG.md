@@ -2,6 +2,8 @@
 
 ## Próxima versão
 
+- Orçamento da discografia configurável no `.env` por `SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET`, aplicado ao menu e comandos com prioridade para `--request-budget`.
+
 - Discografias usam o cursor de `next` em páginas curtas, validam a paginação por posição e recuperam checkpoints antigos; erros incluem detalhes da resposta.
 
 - Álbuns salvos aceitam datas fora de ordem, inclusive para IDs novos, preservando a parada por páginas conhecidas, conferência de páginas, duplicados e retomada.
