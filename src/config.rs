@@ -28,6 +28,14 @@ pub struct Config {
         global = true
     )]
     pub request_interval_ms: u64,
+    /// Orçamento da discografia por execução; sem override, novos jobs usam 200.
+    #[arg(
+        long,
+        env = "SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET",
+        global = true,
+        value_parser = clap::value_parser!(u32).range(5..=10000)
+    )]
+    pub discography_request_budget: Option<u32>,
     #[arg(
         long,
         env = "SPOTIFY_METADATA_TTL_DAYS",
