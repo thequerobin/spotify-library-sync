@@ -142,7 +142,8 @@ async fn interrupted_job_resumes_from_committed_page_and_does_not_change_saved_s
     let empty = page(0, 0, vec![]);
     let mut api = mock(vec![
         ("/me/tracks", 1, second.clone()),
-        ("/me/tracks", 0, first),
+        ("/me/tracks", 0, first.clone()), // bounded search for last imported anchor
+        ("/me/tracks", 0, first),         // independent confirmation pass
         ("/me/tracks", 1, second),
         ("/me/albums", 0, empty.clone()),
         ("/me/albums", 0, empty),
@@ -196,7 +197,7 @@ async fn removal_reconciles_only_after_complete_success_and_preserves_history() 
 }
 
 #[tokio::test]
-async fn mutation_with_same_total_is_detected_and_restarts_collection() -> Result<()> {
+async fn mutation_with_same_total_preserves_import_and_restarts_only_confirmation() -> Result<()> {
     let (_dir, mut db) = setup().await?;
     let job = sync::prepare(&mut db, false, false).await?;
     let a = page(0, 1, vec![saved("track", track("old", "a"))]);
@@ -213,12 +214,25 @@ async fn mutation_with_same_total_is_detected_and_restarts_collection() -> Resul
     assert_eq!(count(&mut db, "SELECT next_offset FROM sync_job").await?, 0);
     assert_eq!(
         count(&mut db, "SELECT COUNT(*) FROM sync_seen_item").await?,
-        0
+        1
     );
     assert_eq!(
         count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
         0
     );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT scan_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        1
+    );
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM full_scan_checkpoint WHERE collection='track'")
+            .fetch_one(&mut db)
+            .await?;
+    assert_eq!(phase, "verifying");
     Ok(())
 }
 
@@ -430,6 +444,308 @@ async fn multiple_album_links_preserve_principal_track_position_and_nested_metad
     assert_eq!(
         count(&mut db, "SELECT COUNT(*) FROM album_musica").await?,
         2
+    );
+    Ok(())
+}
+
+fn range_page(start: i64, total: i64) -> Value {
+    page(
+        start,
+        total,
+        (start..(start + 50).min(total))
+            .map(|i| saved("track", track(&format!("T{i:05}"), "parent")))
+            .collect(),
+    )
+}
+fn page_from(items: &[Value], offset: i64) -> Value {
+    page(
+        offset,
+        items.len() as i64,
+        items
+            .iter()
+            .skip(offset as usize)
+            .take(50)
+            .cloned()
+            .collect(),
+    )
+}
+fn empty_album_calls() -> Vec<(&'static str, i64, Value)> {
+    let p = page(0, 0, vec![]);
+    vec![("/me/albums", 0, p.clone()), ("/me/albums", 0, p)]
+}
+async fn interrupted_prefix(db: &mut SqliteConnection, total: i64, pages: i64) -> Result<String> {
+    let job = sync::prepare(db, false, false).await?;
+    let mut api = mock(
+        (0..pages)
+            .map(|n| ("/me/tracks", n * 50, range_page(n * 50, total)))
+            .collect(),
+    );
+    api.fail_after = Some(pages as usize);
+    let error = sync::run(db, &mut api, &job, 30).await.unwrap_err();
+    sync::record_error(db, &job, &error).await?;
+    Ok(job)
+}
+
+#[tokio::test]
+async fn first_pass_resumes_at_checkpoint_then_walks_back_to_imported_identity() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let job = interrupted_prefix(&mut db, 250, 3).await?;
+    sync::prepare(&mut db, true, false).await?;
+    let mut responses = vec![
+        ("/me/tracks", 150, range_page(150, 250)),
+        ("/me/tracks", 100, range_page(100, 250)),
+        ("/me/tracks", 200, range_page(200, 250)),
+    ];
+    responses.extend((0..5).map(|n| ("/me/tracks", n * 50, range_page(n * 50, 250))));
+    responses.extend(empty_album_calls());
+    let mut api = mock(responses);
+    sync::run(&mut db, &mut api, &job, 30).await?;
+    assert!(api.responses.is_empty());
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT scan_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        250
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT verify_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        250
+    );
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
+        250
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_pass_preserves_old_job_without_ordered_anchor_records() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let job = interrupted_prefix(&mut db, 200, 2).await?;
+    sqlx::query("DELETE FROM full_scan_checkpoint")
+        .execute(&mut db)
+        .await?;
+    sync::prepare(&mut db, true, false).await?;
+    let mut responses = vec![
+        ("/me/tracks", 100, range_page(100, 200)),
+        ("/me/tracks", 50, range_page(50, 200)),
+        ("/me/tracks", 150, range_page(150, 200)),
+    ];
+    responses.extend((0..4).map(|n| ("/me/tracks", n * 50, range_page(n * 50, 200))));
+    responses.extend(empty_album_calls());
+    sync::run(&mut db, &mut mock(responses), &job, 30).await?;
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
+        200
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shifted_offset_finds_last_saved_id_and_never_reimports_from_zero() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let job = interrupted_prefix(&mut db, 200, 2).await?;
+    let mut current: Vec<_> = (0..20)
+        .map(|i| saved("track", track(&format!("New{i:05}"), "parent")))
+        .collect();
+    current.extend((0..200).map(|i| saved("track", track(&format!("T{i:05}"), "parent"))));
+    let mut responses = vec![
+        ("/me/tracks", 100, page_from(&current, 100)),
+        ("/me/tracks", 120, page_from(&current, 120)),
+        ("/me/tracks", 170, page_from(&current, 170)),
+    ];
+    responses.extend((0..5).map(|n| ("/me/tracks", n * 50, page_from(&current, n * 50))));
+    sync::prepare(&mut db, true, false).await?;
+    let e = sync::run(&mut db, &mut mock(responses), &job, 30)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("somente a conferência"));
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT scan_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        220
+    );
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
+        0
+    );
+    // Only confirmation is repeated. Catalog remains intact and has no duplicated IDs.
+    let mut responses: Vec<_> = (0..5)
+        .map(|n| ("/me/tracks", n * 50, page_from(&current, n * 50)))
+        .collect();
+    responses.extend(empty_album_calls());
+    sync::run(&mut db, &mut mock(responses), &job, 30).await?;
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
+        220
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_resume_anchor_pauses_without_discarding_first_pass_checkpoint() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let job = interrupted_prefix(&mut db, 200, 2).await?;
+    sqlx::query("UPDATE sync_job SET resume_search_pages=2")
+        .execute(&mut db)
+        .await?;
+    let other: Vec<_> = (0..200)
+        .map(|i| saved("track", track(&format!("Other{i:05}"), "parent")))
+        .collect();
+    let mut api = mock(vec![
+        ("/me/tracks", 100, page_from(&other, 100)),
+        ("/me/tracks", 50, page_from(&other, 50)),
+    ]);
+    let e = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<sync::WorkPaused>().unwrap().reason,
+        "resume_anchor_missing"
+    );
+    assert_eq!(api.calls, 2);
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT scan_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        100
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT COUNT(*) FROM sync_seen_item WHERE item_type='track'"
+        )
+        .await?,
+        100
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn confirmation_network_failure_keeps_both_pass_checkpoints() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let job = sync::prepare(&mut db, false, false).await?;
+    let mut responses: Vec<_> = (0..4)
+        .map(|n| ("/me/tracks", n * 50, range_page(n * 50, 200)))
+        .collect();
+    responses.extend((0..2).map(|n| ("/me/tracks", n * 50, range_page(n * 50, 200))));
+    let mut api = mock(responses);
+    api.fail_after = Some(6);
+    let e = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    sync::record_error(&mut db, &job, &e).await?;
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT scan_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        200
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT verify_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        100
+    );
+    let mut responses = vec![
+        ("/me/tracks", 0, range_page(0, 200)),
+        ("/me/tracks", 100, range_page(100, 200)),
+        ("/me/tracks", 50, range_page(50, 200)),
+        ("/me/tracks", 150, range_page(150, 200)),
+    ];
+    responses.extend(empty_album_calls());
+    sync::prepare(&mut db, true, false).await?;
+    sync::run(&mut db, &mut mock(responses), &job, 30).await?;
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
+        200
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleting_boundary_items_replays_only_small_overlap() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let job = interrupted_prefix(&mut db, 200, 2).await?;
+    let current: Vec<_> = (0..200)
+        .filter(|i| *i < 95 || *i >= 100)
+        .map(|i| saved("track", track(&format!("T{i:05}"), "parent")))
+        .collect();
+    let mut responses = vec![
+        ("/me/tracks", 100, page_from(&current, 100)),
+        ("/me/tracks", 50, page_from(&current, 50)),
+        ("/me/tracks", 95, page_from(&current, 95)),
+        ("/me/tracks", 145, page_from(&current, 145)),
+    ];
+    responses.extend((0..4).map(|n| ("/me/tracks", n * 50, page_from(&current, n * 50))));
+    let e = sync::run(&mut db, &mut mock(responses), &job, 30)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("conferência"));
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT scan_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        195
+    );
+    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM musica").await?, 200);
+    Ok(())
+}
+
+#[tokio::test]
+async fn total_change_inside_confirmation_preserves_import_frontier() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let job = sync::prepare(&mut db, false, false).await?;
+    let mut responses: Vec<_> = (0..4)
+        .map(|n| ("/me/tracks", n * 50, range_page(n * 50, 200)))
+        .collect();
+    responses.push(("/me/tracks", 0, range_page(0, 200)));
+    responses.push(("/me/tracks", 50, range_page(50, 199)));
+    let e = sync::run(&mut db, &mut mock(responses), &job, 30)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("primeira passagem foi preservada"));
+    sync::record_error(&mut db, &job, &e).await?;
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT scan_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        200
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT verify_offset FROM full_scan_checkpoint WHERE collection='track'"
+        )
+        .await?,
+        0
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT COUNT(*) FROM sync_seen_item WHERE item_type='track'"
+        )
+        .await?,
+        200
+    );
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
+        0
     );
     Ok(())
 }

@@ -46,6 +46,9 @@ enum Command {
         album_budget: Option<u32>,
         #[arg(long, value_parser=clap::value_parser!(u32).range(1..=10))]
         known_pages: Option<u32>,
+        /// Limite de chamadas para reencontrar a referência numa importação completa.
+        #[arg(long, value_parser=clap::value_parser!(u32).range(1..=100))]
+        resume_search_pages: Option<u32>,
         #[arg(long, conflicts_with = "restart")]
         resume: bool,
         #[arg(long)]
@@ -197,6 +200,7 @@ async fn execute(cli: Cli) -> Result<()> {
             request_budget,
             album_budget,
             known_pages,
+            resume_search_pages,
             resume,
             restart,
         } => {
@@ -213,6 +217,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 collection_budget: request_budget,
                 album_budget,
                 known_pages,
+                resume_search_pages,
             };
             let job = sync::prepare_sync(&mut db, resume, &options).await?;
             let mode: String = sqlx::query_scalar("SELECT sync_mode FROM sync_job WHERE id=?")

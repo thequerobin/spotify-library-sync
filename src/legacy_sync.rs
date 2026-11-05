@@ -8,11 +8,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection};
-use std::collections::HashSet;
-
-#[derive(Debug, thiserror::Error)]
-#[error("A biblioteca mudou durante a paginação. O estado salvo foi preservado; execute sync --resume para refazer esta coleção.")]
-struct Unstable;
 
 pub async fn check_cooldown(db: &mut SqliteConnection) -> Result<()> {
     let deadline: Option<String> = sqlx::query_scalar::<_, Option<String>>("SELECT MAX(retry_at) FROM (SELECT retry_at FROM sync_job WHERE status='rate_limited' AND retry_at IS NOT NULL UNION ALL SELECT retry_at FROM api_cooldown)")
@@ -144,144 +139,6 @@ pub(crate) async fn import_album(
     Ok(id)
 }
 
-async fn collect<A: Api>(
-    db: &mut SqliteConnection,
-    api: &mut A,
-    job: &str,
-    kind: &str,
-    full: bool,
-    ttl: u32,
-) -> Result<()> {
-    let row = sqlx::query("SELECT next_offset,total_items FROM sync_job WHERE id=?")
-        .bind(job)
-        .fetch_one(&mut *db)
-        .await?;
-    let mut offset: i64 = row.get("next_offset");
-    let mut total: Option<i64> = row.get("total_items");
-    let endpoint = if kind == "track" {
-        "/me/tracks"
-    } else {
-        "/me/albums"
-    };
-    let bar = ProgressBar::new(total.unwrap_or(0) as u64);
-    bar.set_style(ProgressStyle::with_template(
-        "{msg} [{bar:30}] {pos}/{len}",
-    )?);
-    bar.set_message(if kind == "track" {
-        "Músicas curtidas"
-    } else {
-        "Álbuns salvos"
-    });
-    bar.set_position(offset as u64);
-    while total.is_none() || offset < total.unwrap() {
-        let page: Page = serde_json::from_value(api.get(endpoint, Some(offset)).await?)?;
-        if page.validate(offset, total).is_err() {
-            return Err(Unstable.into());
-        }
-        let fp = fingerprint(&page, kind)?;
-        let mut tx = db.begin().await?;
-        let mut ids = HashSet::new();
-        for item in &page.items {
-            let obj = &item[if kind == "track" { "track" } else { "album" }];
-            let id = if kind == "track" {
-                let album = database::album(&mut tx, &obj["album"]).await?;
-                database::track(&mut tx, obj, &album).await?
-            } else {
-                import_album(&mut tx, job, obj, full, ttl).await?
-            };
-            if !ids.insert(id.clone()) {
-                return Err(Unstable.into());
-            }
-            let inserted = sqlx::query("INSERT OR IGNORE INTO sync_seen_item VALUES(?,?,?,?)")
-                .bind(job)
-                .bind(kind)
-                .bind(&id)
-                .bind(saved_at(item)?)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            if inserted != 1 {
-                return Err(Unstable.into());
-            }
-        }
-        let next = offset + page.items.len() as i64;
-        sqlx::query("INSERT OR REPLACE INTO sync_page VALUES(?,?,?,?,?)")
-            .bind(job)
-            .bind(kind)
-            .bind(offset)
-            .bind(fp)
-            .bind(page.total)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE sync_job SET next_offset=?,processed_items=?,total_items=?,updated_at=? WHERE id=?")
-            .bind(next).bind(next).bind(page.total).bind(now()).bind(job).execute(&mut *tx).await?;
-        tx.commit().await?;
-        offset = next;
-        total = Some(page.total);
-        bar.set_length(page.total as u64);
-        bar.set_position(next as u64);
-    }
-    bar.finish_and_clear();
-    // Offset pagination has no snapshot token. Recheck EVERY page, not just the first or total.
-    let verify = ProgressBar::new(total.unwrap_or(0) as u64);
-    verify.set_style(ProgressStyle::with_template(
-        "{msg} [{bar:30}] {pos}/{len}",
-    )?);
-    verify.set_message(format!("Verificando {kind}"));
-    let mut offset = 0;
-    loop {
-        let page: Page = serde_json::from_value(api.get(endpoint, Some(offset)).await?)?;
-        if page.validate(offset, total).is_err() {
-            return Err(Unstable.into());
-        }
-        let old: Option<String> = sqlx::query_scalar("SELECT fingerprint FROM sync_page WHERE job_id=? AND item_type=? AND page_offset=? AND total=?")
-            .bind(job).bind(kind).bind(offset).bind(page.total).fetch_optional(&mut *db).await?;
-        if old.as_deref() != Some(fingerprint(&page, kind)?.as_str()) {
-            return Err(Unstable.into());
-        }
-        offset += page.items.len() as i64;
-        verify.set_position(offset as u64);
-        if page.next.is_none() {
-            break;
-        }
-    }
-    verify.finish_and_clear();
-    let seen: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sync_seen_item WHERE job_id=? AND item_type=?")
-            .bind(job)
-            .bind(kind)
-            .fetch_one(&mut *db)
-            .await?;
-    if seen != total.unwrap_or(0) {
-        return Err(Unstable.into());
-    }
-    Ok(())
-}
-
-async fn reset_collection(db: &mut SqliteConnection, job: &str, kind: &str) -> Result<()> {
-    let mut tx = db.begin().await?;
-    sqlx::query("DELETE FROM sync_seen_item WHERE job_id=? AND item_type=?")
-        .bind(job)
-        .bind(kind)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM sync_page WHERE job_id=? AND item_type=?")
-        .bind(job)
-        .bind(kind)
-        .execute(&mut *tx)
-        .await?;
-    if kind == "album" {
-        sqlx::query("DELETE FROM sync_album_queue WHERE job_id=?")
-            .bind(job)
-            .execute(&mut *tx)
-            .await?;
-    }
-    sqlx::query("UPDATE sync_job SET next_offset=0,processed_items=0,total_items=NULL,updated_at=? WHERE id=?")
-        .bind(now()).bind(job).execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn album_tracks<A: Api>(db: &mut SqliteConnection, api: &mut A, job: &str) -> Result<()> {
     loop {
         let row = sqlx::query("SELECT album_id,next_offset,total_items FROM sync_album_queue WHERE job_id=? AND status<>'completed' ORDER BY album_id LIMIT 1")
@@ -357,12 +214,7 @@ pub async fn run<A: Api>(
                 } else {
                     "album"
                 };
-                if let Err(error) = collect(db, api, job, kind, full, ttl).await {
-                    if error.is::<Unstable>() {
-                        reset_collection(db, job, kind).await?;
-                    }
-                    return Err(error);
-                }
+                crate::full_scan::collect(db, api, job, kind, full, ttl).await?;
                 stage(
                     db,
                     job,

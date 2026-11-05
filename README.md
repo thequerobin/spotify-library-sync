@@ -32,12 +32,12 @@ cargo build --release --locked
 .\target\release\spotify-sync.exe sync
 ```
 
-## Atualizar uma instalação v0.1.0
+## Atualizar uma instalação v0.1.0 ou v0.2.0
 
 Substitua o executável e mantenha seu `.env` e a pasta `data`. As migrations são aplicadas automaticamente; não é necessário apagar o banco ou refazer o login.
 
 - Se a importação anterior terminou, o próximo `sync` será incremental.
-- Se há um job v0.1.0 pendente, use `sync --resume`. Ele termina usando o protocolo anterior; o modo aparece no terminal como `legacy`.
+- Se há um job v0.1.0 pendente, use `sync --resume`. O modo continua aparecendo como `legacy`, mas a retomada recebe a nova proteção de checkpoints da v0.2.1.
 - O programa não deduz uma importação completa apenas pela quantidade de registros ou pela data mais recente. Se houver estados confirmados sem histórico suficiente, ele pede `--reconcile`, sem iniciar uma varredura cara silenciosamente.
 
 ## Modos de sincronização
@@ -99,6 +99,24 @@ Todas as chamadas passam por um cliente serial, com intervalo padrão de 500 ms.
 
 Ctrl+C pausa a execução. Se fechar o terminal ou reiniciar o PC, os lotes confirmados permanecem; execute `sync --resume` depois. O aplicativo não permanece rodando quando fechado nem inicia automaticamente com o Windows.
 
+## Retomada da primeira importação (v0.2.1)
+
+A importação completa mantém checkpoints separados para a primeira passagem e para a conferência. Ao retomar a primeira passagem, o aplicativo consulta o offset pendente e procura para trás o último item gravado, comparando ID e `added_at`. Se a posição tiver mudado, também procura próximo da posição ajustada pela variação do total. Reutiliza as páginas já obtidas durante essa busca.
+
+Exemplo: uma importação interrompida no offset 7.450 tenta esse ponto e as páginas próximas; ao encontrar a referência, continua dali. A redução ou o aumento do total não apaga o catálogo nem zera automaticamente a primeira passagem. Pequenas sobreposições são tratadas por UPSERT. Jobs antigos que só armazenavam hashes de página podem usar uma sobreposição de IDs confirmados como referência.
+
+A busca é limitada a 10 chamadas por retomada, incluindo tentativas HTTP repetidas. Se a referência não aparecer dentro desse limite, a execução pausa preservando o checkpoint:
+
+```bash
+spotify-sync sync --resume --resume-search-pages 30
+```
+
+O limite aceita de 1 a 100 chamadas e é persistido no job. Se todas as referências desaparecerem, será necessário decidir explicitamente entre ampliar a busca e começar outra execução com `--restart`; não há reinício completo silencioso.
+
+Na conferência, uma falha de rede também permite retomar seu próprio checkpoint. Se o cabeçalho ou a posição mudar, somente a conferência é reiniciada. Se o conjunto observado diferir da primeira passagem, os dados novos são incorporados ao catálogo e é solicitada outra conferência, sem repetir a importação. Os estados e as remoções só são publicados depois de obter uma conferência completa compatível com o conjunto anterior.
+
+`status` inclui `full_passes`, com `phase`, `imported_offset` e `verified_offset`. O terminal distingue “importação” de “conferência — importação preservada”. Isso não cria um snapshot no Spotify; uma biblioteca em alteração contínua ainda pode precisar de novas conferências. Um checkpoint já apagado por um executável anterior não pode ser recuperado apenas pelo número que apareceu no terminal.
+
 ## Consultas offline
 
 ```bash
@@ -138,7 +156,8 @@ Flags explícitas de orçamento podem aumentar ou reduzir o limite numa retomada
 ## Código e validação
 
 - `src/sync.rs`: modo incremental, referências congeladas, publicação por coleção, orçamentos, status e confirmação direcionada.
-- `src/legacy_sync.rs`: listagens completas e retomada do protocolo v0.1.0.
+- `src/legacy_sync.rs`: compatibilidade com modos completos e jobs v0.1.0.
+- `src/full_scan.rs`: importação e conferência completas com checkpoints independentes e busca de referências na retomada.
 - `src/spotify.rs`: transporte, paginação, query tipada, quotas e retries.
 - `src/database.rs`: catálogo, JSON original, vínculos e reconciliação completa protegida contra uso incremental.
 - `src/auth.rs`: PKCE, callback, refresh e cofre do sistema.

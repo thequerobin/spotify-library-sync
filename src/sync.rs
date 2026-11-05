@@ -18,6 +18,7 @@ pub struct Options {
     pub collection_budget: Option<u32>,
     pub album_budget: Option<u32>,
     pub known_pages: Option<u32>,
+    pub resume_search_pages: Option<u32>,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -35,6 +36,12 @@ pub async fn prepare_sync(
     options: &Options,
 ) -> Result<String> {
     check_cooldown(db).await?;
+    if options
+        .resume_search_pages
+        .is_some_and(|n| n == 0 || n > 100)
+    {
+        bail!("Busca de referência deve usar entre 1 e 100 requisições");
+    }
     if options.full && options.reconcile {
         bail!("Escolha apenas --full ou --reconcile");
     }
@@ -52,8 +59,8 @@ pub async fn prepare_sync(
         if !resume {
             bail!("Há uma sincronização pendente. Use sync --resume ou sync --restart");
         }
-        sqlx::query("UPDATE sync_job SET status='running',last_error=NULL,pause_reason=NULL,retry_at=NULL,collection_budget=COALESCE(?,collection_budget),album_budget=COALESCE(?,album_budget),known_pages=COALESCE(?,known_pages),updated_at=? WHERE id=?")
-            .bind(options.collection_budget).bind(options.album_budget).bind(options.known_pages).bind(now()).bind(&job).execute(&mut *db).await?;
+        sqlx::query("UPDATE sync_job SET status='running',last_error=NULL,pause_reason=NULL,retry_at=NULL,collection_budget=COALESCE(?,collection_budget),album_budget=COALESCE(?,album_budget),known_pages=COALESCE(?,known_pages),resume_search_pages=COALESCE(?,resume_search_pages),updated_at=? WHERE id=?")
+            .bind(options.collection_budget).bind(options.album_budget).bind(options.known_pages).bind(options.resume_search_pages).bind(now()).bind(&job).execute(&mut *db).await?;
         return Ok(job);
     }
     if resume {
@@ -86,9 +93,9 @@ pub async fn prepare_sync(
         rand::random::<u64>()
     );
     let mut tx = db.begin().await?;
-    sqlx::query("INSERT INTO sync_job(id,job_type,sync_mode,status,stage,coverage,collection_budget,album_budget,known_pages,started_at,updated_at) VALUES(?,?,?,'running','tracks',?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO sync_job(id,job_type,sync_mode,status,stage,coverage,collection_budget,album_budget,known_pages,resume_search_pages,started_at,updated_at) VALUES(?,?,?,'running','tracks',?,?,?,?,?,?,?)")
         .bind(&id).bind(mode).bind(mode).bind(if mode=="incremental" {"recent_window"} else {"full_listing"})
-        .bind(options.collection_budget.unwrap_or(20)).bind(options.album_budget.unwrap_or(20)).bind(options.known_pages.unwrap_or(2)).bind(now()).bind(now()).execute(&mut *tx).await?;
+        .bind(options.collection_budget.unwrap_or(20)).bind(options.album_budget.unwrap_or(20)).bind(options.known_pages.unwrap_or(2)).bind(options.resume_search_pages.unwrap_or(10)).bind(now()).bind(now()).execute(&mut *tx).await?;
     // Preserve unfinished album work across --restart, including previously published scopes.
     sqlx::query("INSERT INTO sync_album_queue(job_id,album_id,status,next_offset,total_items,attempts,last_error,updated_at) SELECT ?,album_id,'pending',next_offset,total_items,attempts,last_error,updated_at FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY album_id ORDER BY updated_at DESC,job_id DESC) n FROM sync_album_queue WHERE status IN('pending','running')) WHERE n=1")
         .bind(&id).execute(&mut *tx).await?;
@@ -139,7 +146,7 @@ pub async fn record_error(
     } else {
         work.map(|p| p.reason)
     };
-    sqlx::query("UPDATE sync_job SET status=?,pause_reason=?,last_error=?,error_count=error_count+1,retry_at=?,updated_at=?,coverage=CASE WHEN ? IN('window_changed','ordering_inconclusive') THEN 'inconclusive' ELSE coverage END WHERE id=?")
+    sqlx::query("UPDATE sync_job SET status=?,pause_reason=?,last_error=?,error_count=error_count+1,retry_at=?,updated_at=?,coverage=CASE WHEN ? IN('window_changed','ordering_inconclusive','confirmation_changed','pagination_changed','resume_anchor_missing') THEN 'inconclusive' ELSE coverage END WHERE id=?")
         .bind(status).bind(reason).bind(error.to_string()).bind(quota.and_then(|p|p.retry_at.map(|t|t.to_rfc3339()))).bind(now()).bind(reason).bind(job).execute(db).await?;
     Ok(())
 }
@@ -610,9 +617,11 @@ pub async fn status(db: &mut SqliteConnection) -> Result<Value> {
     let states=sqlx::query("SELECT collection,last_incremental_completed_at,last_full_reconciliation_at,last_coverage FROM library_sync_state ORDER BY collection").fetch_all(&mut *db).await?;
     let scope=sqlx::query("SELECT collection,state,next_offset,pages_processed,consecutive_known,stop_reason,requests_total,invocation_requests,request_limit FROM sync_scope WHERE job_id=(SELECT id FROM sync_job ORDER BY started_at DESC LIMIT 1) ORDER BY collection").fetch_all(&mut *db).await?;
     let queue:Option<String>=sqlx::query_scalar("SELECT json_object('album_id',album_id,'offset',next_offset,'status',status,'last_error',last_error) FROM sync_album_queue WHERE job_id=(SELECT id FROM sync_job ORDER BY started_at DESC LIMIT 1) AND status<>'completed' ORDER BY album_id LIMIT 1").fetch_optional(&mut *db).await?;
+    let passes=sqlx::query("SELECT collection,phase,scan_offset,scan_total,verify_offset,verify_total FROM full_scan_checkpoint WHERE job_id=(SELECT id FROM sync_job ORDER BY started_at DESC LIMIT 1) ORDER BY collection").fetch_all(&mut *db).await?;
     Ok(
         json!({"job":row.map(|s|serde_json::from_str::<Value>(&s)).transpose()?,"current_album":queue.map(|s|serde_json::from_str::<Value>(&s)).transpose()?,
         "collections":states.iter().map(|r|json!({"collection":r.get::<String,_>("collection"),"last_incremental":r.get::<Option<String>,_>("last_incremental_completed_at"),"last_reconciliation":r.get::<Option<String>,_>("last_full_reconciliation_at"),"coverage":r.get::<String,_>("last_coverage")})).collect::<Vec<_>>(),
+        "full_passes":passes.iter().map(|r|json!({"collection":r.get::<String,_>("collection"),"phase":r.get::<String,_>("phase"),"imported_offset":r.get::<i64,_>("scan_offset"),"import_total":r.get::<Option<i64>,_>("scan_total"),"verified_offset":r.get::<i64,_>("verify_offset"),"verify_total":r.get::<Option<i64>,_>("verify_total")})).collect::<Vec<_>>(),
         "scopes":scope.iter().map(|r|json!({"collection":r.get::<String,_>("collection"),"state":r.get::<String,_>("state"),"offset":r.get::<i64,_>("next_offset"),"pages":r.get::<i64,_>("pages_processed"),"known_pages":r.get::<i64,_>("consecutive_known"),"stop_reason":r.get::<Option<String>,_>("stop_reason"),"requests":r.get::<i64,_>("requests_total"),"invocation_requests":r.get::<i64,_>("invocation_requests"),"request_limit":r.get::<Option<i64>,_>("request_limit")})).collect::<Vec<_>>() }),
     )
 }

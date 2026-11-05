@@ -1,15 +1,15 @@
-# Validação — v0.2.0
+# Validação — v0.2.1
 
 Data: 05/11/2026. Ambiente local: Linux x86_64, Rust 1.99.1.
 
 - `cargo fmt -- --check`: aprovado.
 - `cargo clippy --locked --all-targets -- -D warnings`: aprovado, sem avisos.
-- `cargo test --locked --all-targets`: **40 testes**, sem falhas.
+- `cargo test --locked --all-targets`: **47 testes**, sem falhas.
 - `cargo build --release --locked`: compilação Linux aprovada.
 - `cargo build --release --locked --target x86_64-pc-windows-gnu`: compilação Windows x64 aprovada por cross-compilation com MinGW.
 - Executável Windows: formato PE32+ x86-64 e imports de DLLs inspecionados; somente bibliotecas do sistema.
 - Smoke test do release Linux: versão, ajuda, status e consultas locais, sem credenciais.
-- Banco criado por release: cinco migrations aplicadas, `PRAGMA integrity_check` igual a `ok`.
+- Banco criado por release: seis migrations aplicadas, `PRAGMA integrity_check` igual a `ok`.
 
 ## Cenários cobertos
 
@@ -40,9 +40,11 @@ Consultas offline com datas, artista, parâmetros vinculados e paginação; lock
 - Fila de faixas com orçamento independente, mantendo coleções publicadas e retomando só as faixas restantes.
 - Atualização de álbum observado cuja quantidade de faixas mudou.
 
-### Protocolo e regressões — 16 testes
+### Protocolo, regressões e retomada completa — 23 testes
 
-Três testes de PKCE, Retry-After, quota e paginação, além de treze regressões da importação inicial, UPSERT, cache, reconciliação, histórico, rollback, contas, retomada, JSON original e vínculos entre artistas, músicas e álbuns.
+Três testes de PKCE, Retry-After, quota e paginação, além de vinte regressões da importação inicial, UPSERT, cache, reconciliação, histórico, rollback, contas, retomada, JSON original e vínculos entre artistas, músicas e álbuns.
+
+Os sete cenários adicionais da v0.2.1 cobrem: retomada no offset pendente com busca para trás; jobs antigos sem referência ordenada; deslocamento por adições no início; limite de busca sem apagar progresso; interrupção da conferência com ambos os checkpoints preservados; exclusão de referências de fronteira; mudança do total durante a conferência. O teste de alteração com total constante também confirma que somente a conferência é reiniciada.
 
 ## Limitações da validação local
 

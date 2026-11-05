@@ -234,7 +234,7 @@ pub async fn finish(db: &mut SqliteConnection, job: &str) -> Result<Value> {
         sqlx::query("UPDATE library_sync_state SET account_id=COALESCE((SELECT id FROM account LIMIT 1),''),initial_import_completed_at=COALESCE(initial_import_completed_at,?),last_full_reconciliation_at=?,last_successful_job_id=?,last_coverage='full_listing',watermark_added_at=(SELECT MAX(saved_at) FROM sync_seen_item WHERE job_id=? AND item_type=?),remote_total_last_seen=(SELECT COUNT(*) FROM sync_seen_item WHERE job_id=? AND item_type=?) WHERE collection=?")
             .bind(now()).bind(now()).bind(job).bind(job).bind(kind).bind(job).bind(kind).bind(kind).execute(&mut *tx).await?;
     }
-    sqlx::query("UPDATE sync_job SET status='completed',stage='done',completed_at=?,updated_at=?,summary_json=?,last_error=NULL WHERE id=?")
+    sqlx::query("UPDATE sync_job SET status='completed',stage='done',coverage='full_listing',completed_at=?,updated_at=?,summary_json=?,last_error=NULL WHERE id=?")
         .bind(now()).bind(now()).bind(summary.to_string()).bind(job).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(summary)
