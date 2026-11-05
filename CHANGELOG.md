@@ -2,6 +2,8 @@
 
 ## Próxima versão
 
+- Discografias usam o cursor de `next` em páginas curtas, validam a paginação por posição e recuperam checkpoints antigos; erros incluem detalhes da resposta.
+
 - Álbuns salvos aceitam datas fora de ordem, inclusive para IDs novos, preservando a parada por páginas conhecidas, conferência de páginas, duplicados e retomada.
 
 - Pausas por ordem incompatível informam coleção, página, ID, datas UTC e classificação na referência, sem iniciar uma conferência completa.

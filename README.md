@@ -325,3 +325,11 @@ O workflow testa e compila Linux, Windows e macOS e disponibiliza ZIPs nos artef
 - [Criação de playlists](https://developer.spotify.com/documentation/web-api/reference/create-playlist)
 - [Adicionar itens à playlist](https://developer.spotify.com/documentation/web-api/reference/add-items-to-playlist)
 - [Conferir itens da playlist](https://developer.spotify.com/documentation/web-api/reference/get-playlists-items)
+
+### Paginação das discografias
+
+A listagem de lançamentos usa o offset de `next` informado pelo Spotify, validando origem, artista e avanço de dez posições solicitado pelo cliente. Uma página pode conter menos itens que o limite, inclusive nenhum com continuação; o cursor não é calculado pelo tamanho de `items`. A última página pode ser curta quando alcança o fim das posições anunciadas. O progresso mostra posição/total, não a quantidade de lançamentos importados.
+
+Na retomada (opção 5), a página anterior é conferida e seu cursor é reaplicado, inclusive para checkpoints antigos calculados pela quantidade de itens. Artistas já concluídos são preservados. Mudanças de total, fim prematuro e cursores inválidos continuam pausando a coleta e agora incluem o artista, offsets, quantidade, total e `next` no diagnóstico. Somente os offsets são utilizados: URLs retornadas pela API nunca recebem chamadas autenticadas diretamente.
+
+Referência: [paginação dos álbuns de um artista](https://developer.spotify.com/documentation/web-api/reference/get-an-artists-albums).

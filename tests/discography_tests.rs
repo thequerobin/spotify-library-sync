@@ -26,6 +26,7 @@ struct Mock {
     fail_at: Option<usize>,
     quota_at: Option<usize>,
     malformed_follow: bool,
+    release_pages: HashMap<(String, i64), Value>,
 }
 impl Mock {
     fn new(ids: &[&str]) -> Self {
@@ -37,6 +38,7 @@ impl Mock {
             fail_at: None,
             quota_at: None,
             malformed_follow: false,
+            release_pages: HashMap::new(),
         }
     }
     fn hit(&mut self, call: Call) -> Result<()> {
@@ -104,11 +106,21 @@ impl Api for Mock {
             groups.into(),
             market.map(str::to_owned),
         ))?;
-        Ok(page(
+        if let Some(page) = self.release_pages.get(&(id.to_owned(), offset)) {
+            return Ok(page.clone());
+        }
+        let mut response = page(
             self.releases.get(id).map(Vec::as_slice).unwrap_or(&[]),
             offset,
             10,
-        ))
+        );
+        if !response["next"].is_null() {
+            response["next"] = json!(format!(
+                "https://api.spotify.com/v1/artists/{id}/albums?offset={}&limit=10",
+                offset + 10
+            ));
+        }
+        Ok(response)
     }
     async fn album_tracks(&mut self, id: &str, offset: i64, market: Option<&str>) -> Result<Value> {
         self.hit(Call::Tracks(id.into(), offset, market.map(str::to_owned)))?;
@@ -922,5 +934,137 @@ async fn catalog_change_on_resume_repositions_only_current_artist_and_keeps_othe
         .calls
         .iter()
         .any(|c| matches!(c,Call::Albums(a,..) if a=="A")));
+    Ok(())
+}
+
+fn release_page(offset: i64, total: i64, count: usize, next: Option<i64>) -> Value {
+    json!({"offset":offset,"total":total,"items":(0..count).map(|i|album(&format!("R{offset}N{i}"), &["A"],0)).collect::<Vec<_>>(),"next":next.map(|n|format!("https://api.spotify.com/v1/artists/A/albums?offset={n}&limit=10"))})
+}
+
+#[tokio::test]
+async fn sparse_release_pages_follow_server_offsets_including_empty_and_short_terminal_pages(
+) -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let mut api = Mock::new(&["A"]);
+    api.release_pages
+        .insert(("A".into(), 0), release_page(0, 30, 7, Some(10)));
+    api.release_pages
+        .insert(("A".into(), 10), release_page(10, 30, 0, Some(20)));
+    api.release_pages
+        .insert(("A".into(), 20), release_page(20, 30, 3, None));
+    execute(
+        &mut db,
+        &mut api,
+        Options {
+            catalog_only: true,
+            ..Options::default()
+        },
+    )
+    .await?;
+    let offsets: Vec<_> = api
+        .calls
+        .iter()
+        .filter_map(|c| {
+            if let Call::Albums(_, offset, ..) = c {
+                Some(*offset)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(offsets, vec![0, 10, 20]);
+    assert_eq!(
+        n(&mut db, "SELECT COUNT(*) FROM artista_lancamento").await?,
+        10
+    );
+    assert_eq!(
+        n(
+            &mut db,
+            "SELECT COUNT(*) FROM discografia_artista_queue WHERE state='completed'"
+        )
+        .await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_release_resume_repairs_old_item_count_cursor() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let mut api = Mock::new(&["A"]);
+    api.release_pages
+        .insert(("A".into(), 0), release_page(0, 20, 7, Some(10)));
+    api.release_pages
+        .insert(("A".into(), 10), release_page(10, 20, 5, None));
+    api.fail_at = Some(3);
+    let job = discography::prepare(
+        &mut db,
+        false,
+        "sync",
+        Options {
+            catalog_only: true,
+            ..Options::default()
+        },
+    )
+    .await?;
+    let error = discography::run(&mut db, &mut api, &job).await.unwrap_err();
+    discography::record_error(&mut db, &job, &error).await?;
+    sqlx::query("UPDATE discografia_artista_queue SET next_offset=7 WHERE artista_id='A'")
+        .execute(&mut db)
+        .await?;
+    api.fail_at = None;
+    api.calls.clear();
+    discography::prepare(&mut db, true, "sync", Options::default()).await?;
+    discography::run(&mut db, &mut api, &job).await?;
+    let offsets: Vec<_> = api
+        .calls
+        .iter()
+        .filter_map(|c| {
+            if let Call::Albums(_, offset, ..) = c {
+                Some(*offset)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(offsets, vec![0, 10]);
+    assert_eq!(
+        n(&mut db, "SELECT COUNT(*) FROM artista_lancamento").await?,
+        12
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_release_cursors_and_premature_end_never_complete_artist() -> Result<()> {
+    for invalid in [Some(0), Some(5), Some(20), None] {
+        let (_dir, mut db) = setup().await?;
+        let mut api = Mock::new(&["A"]);
+        api.release_pages
+            .insert(("A".into(), 0), release_page(0, 30, 7, invalid));
+        let error = execute(
+            &mut db,
+            &mut api,
+            Options {
+                catalog_only: true,
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<sync::WorkPaused>().unwrap().reason,
+            "artist_catalog_changed"
+        );
+        assert!(error.to_string().contains("Offset solicitado: 0"));
+        assert_eq!(
+            n(
+                &mut db,
+                "SELECT COUNT(*) FROM discografia_artista_queue WHERE state='completed'"
+            )
+            .await?,
+            0
+        );
+    }
     Ok(())
 }
