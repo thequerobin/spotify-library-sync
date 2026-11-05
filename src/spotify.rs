@@ -1,0 +1,377 @@
+use crate::{auth::Auth, database::now};
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rand::Rng;
+use serde::Deserialize;
+use serde_json::Value;
+use sqlx::SqlitePool;
+use std::time::{Duration, Instant, SystemTime};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct Paused {
+    pub message: String,
+    pub retry_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Error)]
+#[error("Orçamento de requisições esgotado; progresso preservado. Continue com sync --resume ou aumente o orçamento explicitamente.")]
+pub struct BudgetExhausted;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Page {
+    pub items: Vec<Value>,
+    pub offset: i64,
+    pub total: i64,
+    pub next: Option<String>,
+}
+impl Page {
+    pub fn validate(&self, expected_offset: i64, expected_total: Option<i64>) -> Result<bool> {
+        if self.offset != expected_offset
+            || self.total < 0
+            || self.items.len() > 50
+            || expected_total.is_some_and(|t| self.total != t)
+        {
+            bail!("Paginação inconsistente: biblioteca alterada ou resposta inválida; execute sync --resume");
+        }
+        let end = self.offset + self.items.len() as i64;
+        if end > self.total
+            || (self.items.is_empty() && end < self.total)
+            || (self.next.is_some() != (end < self.total))
+        {
+            bail!("Paginação incompleta: reconciliação bloqueada");
+        }
+        Ok(end == self.total)
+    }
+}
+
+#[async_trait]
+pub trait Api: Send {
+    async fn get(&mut self, path: &str, offset: Option<i64>) -> Result<Value>;
+    async fn contains(&mut self, _uris: &[String]) -> Result<Value> {
+        bail!("Consulta contains não suportada por este cliente")
+    }
+    fn set_budget(&mut self, _remaining: Option<u32>) {}
+    fn attempt_count(&self) -> u64 {
+        0
+    }
+}
+
+pub struct Spotify {
+    pub auth: Auth,
+    http: reqwest::Client,
+    base_url: String,
+    interval: Duration,
+    last_request: Option<Instant>,
+    budget_remaining: Option<u32>,
+    attempts: u64,
+    pub metrics: Option<(SqlitePool, String)>,
+}
+impl Spotify {
+    pub fn new(auth: Auth, interval_ms: u64) -> Result<Self> {
+        Ok(Self {
+            auth,
+            base_url: "https://api.spotify.com/v1".into(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(45))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            interval: Duration::from_millis(interval_ms),
+            last_request: None,
+            budget_remaining: None,
+            attempts: 0,
+            metrics: None,
+        })
+    }
+    async fn backoff(&self, attempt: u32) -> Result<()> {
+        self.count(true).await?;
+        let jitter = rand::thread_rng().gen_range(0..500);
+        tokio::time::sleep(Duration::from_millis((1u64 << attempt) * 1000 + jitter)).await;
+        Ok(())
+    }
+    async fn count(&self, retry: bool) -> Result<()> {
+        if let Some((pool, job)) = &self.metrics {
+            sqlx::query("UPDATE sync_job SET request_count=request_count+?,retry_count=retry_count+?,updated_at=? WHERE id=?")
+                .bind(if retry {0} else {1}).bind(if retry {1} else {0}).bind(now()).bind(job).execute(pool).await?;
+        }
+        Ok(())
+    }
+}
+
+pub fn retry_after(header: Option<&str>) -> Duration {
+    header
+        .and_then(|s| {
+            s.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+                httpdate::parse_http_date(s)
+                    .ok()
+                    .map(|date| date.duration_since(SystemTime::now()).unwrap_or_default())
+            })
+        })
+        .unwrap_or(Duration::from_secs(60))
+}
+pub fn quota_exceeded(body: &Value) -> bool {
+    body.pointer("/error/reason")
+        .or_else(|| body.pointer("/error/code"))
+        .or_else(|| body.get("reason"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("QUOTA_EXCEEDED"))
+        || body
+            .to_string()
+            .to_ascii_uppercase()
+            .contains("QUOTA_EXCEEDED")
+}
+
+impl Spotify {
+    async fn request(&mut self, path: &str, parameters: &[(&str, String)]) -> Result<Value> {
+        // Never follow API-supplied URLs with Authorization credentials.
+        if !path.starts_with('/')
+            || path.contains("://")
+            || path.contains('?')
+            || path.contains('#')
+        {
+            bail!("Caminho de API inválido");
+        }
+        let mut refreshed = false;
+        for attempt in 0..=4u32 {
+            if let Some(last) = self.last_request {
+                tokio::time::sleep(self.interval.saturating_sub(last.elapsed())).await;
+            }
+            if let Some(remaining) = &mut self.budget_remaining {
+                if *remaining == 0 {
+                    return Err(BudgetExhausted.into());
+                }
+                *remaining -= 1;
+            }
+            let token = self.auth.access_token().await?.to_owned();
+            self.attempts += 1;
+            self.count(false).await?;
+            self.last_request = Some(Instant::now());
+            let mut request = self
+                .http
+                .get(format!("{}{path}", self.base_url))
+                .bearer_auth(token);
+            request = request.query(parameters);
+            let response = request.send().await;
+            if let Ok(response) = response {
+                let status = response.status();
+                if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                    refreshed = true;
+                    self.auth.refresh().await?;
+                    self.count(true).await?;
+                    continue;
+                }
+                let wait = retry_after(
+                    response
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                let bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        if attempt == 4 {
+                            bail!("Falha de leitura da resposta Spotify após 5 tentativas");
+                        }
+                        self.backoff(attempt).await?;
+                        continue;
+                    }
+                };
+                let parsed = serde_json::from_slice::<Value>(&bytes);
+                let body = parsed.as_ref().ok().cloned().unwrap_or(Value::Null);
+                let quota = quota_exceeded(&body)
+                    || String::from_utf8_lossy(&bytes)
+                        .to_ascii_uppercase()
+                        .contains("QUOTA_EXCEEDED");
+                if quota || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let retry_at = Utc::now().checked_add_signed(
+                        chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::days(1)),
+                    );
+                    return Err(Paused { message: if quota {
+                        "QUOTA_EXCEEDED: sincronização pausada; retome posteriormente com sync --resume".into()
+                    } else { format!("HTTP 429: aguarde pelo menos {} segundos e execute sync --resume", wait.as_secs()) }, retry_at }.into());
+                }
+                if status.is_success() {
+                    return parsed.context("Resposta Spotify não contém JSON válido");
+                }
+                if !status.is_server_error() {
+                    bail!("Spotify retornou HTTP {status}; verifique as permissões do aplicativo e execute login se necessário");
+                }
+            }
+            if attempt == 4 {
+                bail!("Spotify indisponível após 5 tentativas; checkpoint preservado");
+            }
+            self.backoff(attempt).await?;
+        }
+        bail!("Limite de tentativas atingido; checkpoint preservado")
+    }
+}
+
+#[async_trait]
+impl Api for Spotify {
+    async fn get(&mut self, path: &str, offset: Option<i64>) -> Result<Value> {
+        let params = offset
+            .map(|n| vec![("limit", "50".to_owned()), ("offset", n.to_string())])
+            .unwrap_or_default();
+        self.request(path, &params).await
+    }
+    async fn contains(&mut self, uris: &[String]) -> Result<Value> {
+        if uris.is_empty() || uris.len() > 40 {
+            bail!("Contains aceita entre 1 e 40 URIs por requisição");
+        }
+        self.request("/me/library/contains", &[("uris", uris.join(","))])
+            .await
+    }
+    fn set_budget(&mut self, remaining: Option<u32>) {
+        self.budget_remaining = remaining;
+    }
+    fn attempt_count(&self) -> u64 {
+        self.attempts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    async fn server(
+        replies: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            for (status, headers, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 8192];
+                let n = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]).to_lowercase();
+                assert!(request.contains("authorization: bearer test-token"));
+                assert!(request.starts_with("get /me/tracks?limit=50&offset=0"));
+                let reply=format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",body.len());
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (address, handle)
+    }
+    async fn client(base_url: String) -> Spotify {
+        let mut client = Spotify::new(Auth::for_test(), 0).unwrap();
+        client.base_url = base_url;
+        client.http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        client
+    }
+    #[tokio::test]
+    async fn actual_429_without_json_pauses_with_retry_after() {
+        let (url, handle) = server(vec![(
+            "429 Too Many Requests",
+            "Retry-After: 120\r\n",
+            "limit",
+        )])
+        .await;
+        let error = client(url)
+            .await
+            .get("/me/tracks", Some(0))
+            .await
+            .unwrap_err();
+        let pause = error.downcast_ref::<Paused>().unwrap();
+        assert!(pause.retry_at.unwrap() > Utc::now() + chrono::Duration::seconds(118));
+        handle.await.unwrap();
+    }
+    #[tokio::test]
+    async fn actual_quota_403_stops_without_retrying() {
+        let (url, handle) = server(vec![(
+            "403 Forbidden",
+            "",
+            r#"{"error":{"reason":"QUOTA_EXCEEDED"}}"#,
+        )])
+        .await;
+        let error = client(url)
+            .await
+            .get("/me/tracks", Some(0))
+            .await
+            .unwrap_err();
+        assert!(error.is::<Paused>());
+        assert!(error.to_string().contains("QUOTA_EXCEEDED"));
+        handle.await.unwrap();
+    }
+    #[tokio::test]
+    async fn transient_html_error_is_retried() {
+        let (url, handle) = server(vec![
+            ("503 Service Unavailable", "", "<html>Unavailable</html>"),
+            ("200 OK", "", r#"{"items":[]}"#),
+        ])
+        .await;
+        let value = client(url).await.get("/me/tracks", Some(0)).await.unwrap();
+        assert_eq!(value, json_value());
+        handle.await.unwrap();
+    }
+    #[tokio::test]
+    async fn retry_attempts_cannot_exceed_request_budget() {
+        let (url, handle) = server(vec![("503 Service Unavailable", "", "temporary")]).await;
+        let mut api = client(url).await;
+        api.set_budget(Some(1));
+        let error = api.get("/me/tracks", Some(0)).await.unwrap_err();
+        assert!(error.is::<BudgetExhausted>());
+        assert_eq!(api.attempt_count(), 1);
+        handle.await.unwrap();
+    }
+    #[tokio::test]
+    async fn contains_uses_typed_encoded_query_without_sending_credentials_to_another_origin() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let n = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..n]);
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let parsed = url::Url::parse(&format!("http://local{target}")).unwrap();
+            assert_eq!(parsed.path(), "/me/library/contains");
+            assert_eq!(
+                parsed.query_pairs().find(|(k, _)| k == "uris").unwrap().1,
+                "spotify:track:abc,spotify:album:def"
+            );
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n[true,false]").await.unwrap();
+        });
+        let mut api = client(url).await;
+        assert_eq!(
+            api.contains(&["spotify:track:abc".into(), "spotify:album:def".into()])
+                .await
+                .unwrap(),
+            serde_json::json!([true, false])
+        );
+        handle.await.unwrap();
+    }
+    fn json_value() -> Value {
+        serde_json::json!({"items":[]})
+    }
+    #[tokio::test]
+    async fn server_redirect_is_not_followed() {
+        let (url, handle) = server(vec![(
+            "307 Temporary Redirect",
+            "Location: http://127.0.0.1:1/\r\n",
+            "{}",
+        )])
+        .await;
+        let error = client(url)
+            .await
+            .get("/me/tracks", Some(0))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("307"));
+        handle.await.unwrap();
+    }
+}

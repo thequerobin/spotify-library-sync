@@ -1,0 +1,42 @@
+name: Test and build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --release --locked
+      - name: Package
+        shell: python
+        run: |
+          import pathlib, platform, zipfile
+          output = pathlib.Path('dist')
+          output.mkdir(exist_ok=True)
+          binary = pathlib.Path('target/release/spotify-sync' + ('.exe' if platform.system() == 'Windows' else ''))
+          name = f'spotify-library-sync-{platform.system().lower()}-{platform.machine().lower()}.zip'
+          with zipfile.ZipFile(output / name, 'w', zipfile.ZIP_DEFLATED) as archive:
+              files = [binary, pathlib.Path('README.md'), pathlib.Path('LICENSE'), pathlib.Path('.env.example')]
+              if platform.system() == 'Windows':
+                  files.append(pathlib.Path('packaging/abrir-terminal.cmd'))
+              for file in files:
+                  archive.write(file, 'spotify-library-sync/' + file.name)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spotify-library-sync-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*.zip

@@ -1,0 +1,39 @@
+[package]
+name = "spotify-library-sync"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Resumable, read-only Spotify library synchronization to SQLite"
+
+[[bin]]
+name = "spotify-sync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+fs2 = "0.4"
+hex = "0.4"
+httpdate = "1"
+indicatif = "0.17"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+webbrowser = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
