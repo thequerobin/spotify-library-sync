@@ -97,6 +97,40 @@ Todas as chamadas passam por um cliente serial, com intervalo padrão de 500 ms.
 
 `429` e `QUOTA_EXCEEDED` interrompem a execução imediatamente e persistem o cooldown. `Retry-After` aceita segundos ou HTTP-date; sem header, o padrão é 60 segundos. O prazo é conferido antes de chamadas de dados e também antes de `--restart`; passar o prazo não garante que a quota já foi liberada.
 
+### Avisos de limite de requisições
+
+O menu e os comandos apresentam o prazo no fuso local configurado no sistema
+(inclusive no Windows/CMD). O deslocamento UTC corresponde à data do prazo;
+não há fuso de Brasília fixado nem consulta de fuso pela internet.
+
+Exemplo em um computador configurado para UTC-03:00:
+
+```text
+Limite de requisições ativo.
+Disponível em: 05/11/2026 às 13:30:11 (UTC-03:00)
+Tempo restante: 12 minutos e 34 segundos.
+Nenhuma requisição foi enviada.
+```
+
+A data usa DD/MM/AAAA, a hora usa 24 horas sem frações de segundo, e o tempo
+restante é recalculado ao exibir a mensagem. Frações positivas são arredondadas
+para cima; períodos longos incluem dias e horas. A conversão considera a mudança
+de dia, mês e ano. Um aviso exibido após o vencimento informa que o prazo encerrou
+e mostra zero segundos, sem contagem negativa.
+
+A última linha acima aparece quando um cooldown já salvo bloqueia a operação.
+Se o Spotify acabou de responder HTTP 429 ou QUOTA_EXCEEDED, o aviso usa a mesma
+data e contagem, mas informa a resposta recebida e a pausa da operação, sem afirmar
+que nenhuma requisição foi enviada. Prazo ausente é identificado como não informado.
+
+Os prazos continuam armazenados e comparados em UTC no SQLite. A apresentação
+local não altera o bloqueio: antes do vencimento, nenhuma nova chamada da operação
+bloqueada é enviada. O vencimento permite tentar retomar; a API pode aplicar outro
+limite. As saídas JSON de status mantêm os timestamps UTC para automação.
+A prévia e a seleção das playlists LSUA/USSA continuam exclusivamente locais,
+disponíveis mesmo durante o cooldown.
+
+
 Ctrl+C pausa a execução. Se fechar o terminal ou reiniciar o PC, os lotes confirmados permanecem; execute `sync --resume` depois. O aplicativo não permanece rodando quando fechado nem inicia automaticamente com o Windows.
 
 ## Retomada da primeira importação (v0.2.1)

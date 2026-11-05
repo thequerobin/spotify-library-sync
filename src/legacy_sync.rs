@@ -1,5 +1,6 @@
 use crate::{
     database::{self, now},
+    rate_limit::CooldownActive,
     spotify::{Api, Page},
 };
 use anyhow::{bail, Context, Result};
@@ -14,7 +15,10 @@ pub async fn check_cooldown(db: &mut SqliteConnection) -> Result<()> {
         .fetch_one(db).await?;
     if let Some(deadline) = deadline {
         if chrono::DateTime::parse_from_rfc3339(&deadline)? > Utc::now() {
-            bail!("Rate limit ativo até {deadline}; nenhuma requisição foi enviada");
+            return Err(CooldownActive {
+                retry_at: chrono::DateTime::parse_from_rfc3339(&deadline)?.with_timezone(&Utc),
+            }
+            .into());
         }
     }
     Ok(())
@@ -32,7 +36,10 @@ pub async fn prepare(db: &mut SqliteConnection, resume: bool, full: bool) -> Res
         if let Some(retry) = row.get::<Option<String>, _>("retry_at") {
             let date = chrono::DateTime::parse_from_rfc3339(&retry)?;
             if date > Utc::now() {
-                bail!("Rate limit ativo até {retry}; retome depois desse horário");
+                return Err(CooldownActive {
+                    retry_at: date.with_timezone(&Utc),
+                }
+                .into());
             }
         }
         let id: String = row.get("id");

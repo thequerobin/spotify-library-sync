@@ -187,3 +187,96 @@ async fn local_playlist_preview_and_cancelled_menu_creation_need_no_credentials(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn cooldown_formats_commands_and_menu_and_keeps_previews_offline() -> Result<()> {
+    use chrono::{Duration, Local, Utc};
+    use spotify_library_sync::{rate_limit::CooldownActive, sync};
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cooldown.db");
+    let mut db = database::open(&path).await?;
+    let deadline = Utc::now() + Duration::hours(1);
+    sqlx::query("INSERT INTO api_cooldown(id,retry_at,reason) VALUES(1,?,'test')")
+        .bind(deadline.to_rfc3339())
+        .execute(&mut db)
+        .await?;
+    let error = sync::check_cooldown(&mut db).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<CooldownActive>().unwrap().retry_at,
+        deadline
+    );
+    db.close().await?;
+
+    let expected = deadline
+        .with_timezone(&Local)
+        .format("%d/%m/%Y às %H:%M:%S (UTC%:z)")
+        .to_string();
+    for args in [
+        vec!["check-saved", "--uri", "spotify:track:test"],
+        vec!["discography", "sync"],
+    ] {
+        let output = invoke(&path, &args);
+        assert!(!output.status.success());
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.starts_with("\nLimite de requisições ativo.\n"), "{text}");
+        assert!(text.contains(&expected), "{text}");
+        assert!(text.contains("Tempo restante:"));
+        assert!(text.ends_with("Nenhuma requisição foi enviada.\n\n"));
+        assert!(!text.contains('\u{1b}'));
+    }
+    let output = interactive(&path, "4\n0\n");
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains(&expected), "{text}");
+    assert!(text.contains("Nenhuma requisição foi enviada."));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0. Sair"));
+    let output = invoke(&path, &["playlist", "preview", "--kind", "lsua"]);
+    assert!(output.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout)?["count"], 0);
+
+    let mut db = database::open(&path).await?;
+    let stored: String = sqlx::query_scalar("SELECT retry_at FROM api_cooldown WHERE id=1")
+        .fetch_one(&mut db)
+        .await?;
+    assert_eq!(stored, deadline.to_rfc3339());
+    sqlx::query("UPDATE api_cooldown SET retry_at=? WHERE id=1")
+        .bind((Utc::now() - Duration::seconds(1)).to_rfc3339())
+        .execute(&mut db)
+        .await?;
+    sync::check_cooldown(&mut db).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_uses_system_timezone_in_child_process() -> Result<()> {
+    use chrono::{Duration, FixedOffset, Utc};
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("timezone.db");
+    let mut db = database::open(&path).await?;
+    let deadline = Utc::now() + Duration::days(1);
+    sqlx::query("INSERT INTO api_cooldown(id,retry_at,reason) VALUES(1,?,'test')")
+        .bind(deadline.to_rfc3339())
+        .execute(&mut db)
+        .await?;
+    db.close().await?;
+    for (zone, offset) in [("UTC", 0), ("Asia/Kathmandu", 20700)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_spotify-sync"))
+            .arg("--database")
+            .arg(&path)
+            .args(["check-saved", "--uri", "spotify:track:test"])
+            .env("TZ", zone)
+            .env_remove("SPOTIFY_CLIENT_ID")
+            .output()?;
+        assert!(!output.status.success());
+        let expected = deadline
+            .with_timezone(&FixedOffset::east_opt(offset).unwrap())
+            .format("%d/%m/%Y às %H:%M:%S (UTC%:z)")
+            .to_string();
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains(&expected), "{text}");
+    }
+    Ok(())
+}

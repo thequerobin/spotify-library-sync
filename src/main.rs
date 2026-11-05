@@ -6,6 +6,7 @@ use spotify_library_sync::{
     auth::Auth,
     config::Config,
     database, discography, playlist,
+    rate_limit::error_message,
     spotify::{Api, Spotify},
     sync,
 };
@@ -693,7 +694,7 @@ async fn main() {
         execute(cli).await
     };
     if let Err(error) = result {
-        eprintln!("Erro: {error:#}");
+        eprintln!("\n{}\n", error_message(&error));
         std::process::exit(1);
     }
 }

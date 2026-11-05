@@ -9,12 +9,24 @@ use sqlx::SqlitePool;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
-#[error("{message}")]
+#[derive(Debug)]
 pub struct Paused {
     pub message: String,
     pub retry_at: Option<DateTime<Utc>>,
 }
+
+impl std::fmt::Display for Paused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}\n{}",
+            crate::rate_limit::local_notice(self.retry_at),
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for Paused {}
 
 #[derive(Debug, Error)]
 #[error("Gravação rejeitada antes de ser aplicada")]
@@ -246,7 +258,7 @@ impl Spotify {
                     );
                     let error:anyhow::Error=Paused { message: if quota {
                         "QUOTA_EXCEEDED: sincronização pausada; retome posteriormente com sync --resume".into()
-                    } else { format!("HTTP 429: aguarde pelo menos {} segundos e execute sync --resume", wait.as_secs()) }, retry_at }.into();
+                    } else { "HTTP 429: execução pausada; retome a operação após o prazo.".into() }, retry_at }.into();
                     return Err(if writing && !status.is_success() {
                         error.context(WriteRejected)
                     } else {

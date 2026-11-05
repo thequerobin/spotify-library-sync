@@ -1,5 +1,11 @@
 # Alterações
 
+## Próxima versão
+
+- Avisos de rate limit no fuso local do sistema, com data, hora, deslocamento UTC e tempo restante atualizado.
+- Apresentação compartilhada entre menu/CMD, comandos, HTTP 429 e QUOTA_EXCEEDED; cooldown e status persistidos em UTC.
+- Testes de fusos, virada de data, vencimento, arredondamento, bloqueio persistido e seleção local durante cooldown.
+
 ## 0.4.0 — 05/11/2026
 
 - Menu interativo no CMD ao executar sem argumentos; o iniciador Windows abre o menu.

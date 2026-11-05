@@ -147,7 +147,7 @@ pub async fn run(config: Config) -> Result<()> {
                 })
                 .await
                 {
-                    eprintln!("Erro: {error:#}");
+                    eprintln!("\n{}\n", error_message(&error));
                 }
                 if choice == "6" {
                     if let Err(error) = execute(Cli {
@@ -158,12 +158,12 @@ pub async fn run(config: Config) -> Result<()> {
                     })
                     .await
                     {
-                        eprintln!("Erro: {error:#}");
+                        eprintln!("\n{}\n", error_message(&error));
                     }
                 }
             }
             Ok(None) => {}
-            Err(error) => eprintln!("Erro: {error:#}"),
+            Err(error) => eprintln!("\n{}\n", error_message(&error)),
         }
     }
     Ok(())

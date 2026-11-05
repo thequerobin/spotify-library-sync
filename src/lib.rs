@@ -5,5 +5,6 @@ pub mod discography;
 mod full_scan;
 mod legacy_sync;
 pub mod playlist;
+pub mod rate_limit;
 pub mod spotify;
 pub mod sync;
