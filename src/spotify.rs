@@ -9,24 +9,12 @@ use sqlx::SqlitePool;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{message}")]
 pub struct Paused {
     pub message: String,
     pub retry_at: Option<DateTime<Utc>>,
 }
-
-impl std::fmt::Display for Paused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}\n{}",
-            crate::rate_limit::local_notice(self.retry_at),
-            self.message
-        )
-    }
-}
-
-impl std::error::Error for Paused {}
 
 #[derive(Debug, Error)]
 #[error("Gravação rejeitada antes de ser aplicada")]

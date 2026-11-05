@@ -219,7 +219,10 @@ async fn cooldown_formats_commands_and_menu_and_keeps_previews_offline() -> Resu
         let output = invoke(&path, &args);
         assert!(!output.status.success());
         let text = String::from_utf8_lossy(&output.stderr);
-        assert!(text.starts_with("\nLimite de requisições ativo.\n"), "{text}");
+        assert!(
+            text.starts_with("\nLimite de requisições ativo.\n"),
+            "{text}"
+        );
         assert!(text.contains(&expected), "{text}");
         assert!(text.contains("Tempo restante:"));
         assert!(text.ends_with("Nenhuma requisição foi enviada.\n\n"));

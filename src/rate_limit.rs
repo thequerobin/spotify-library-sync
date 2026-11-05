@@ -79,7 +79,7 @@ pub fn error_message(error: &anyhow::Error) -> String {
     if let Some(cooldown) = error.downcast_ref::<CooldownActive>() {
         cooldown.to_string()
     } else if let Some(paused) = error.downcast_ref::<crate::spotify::Paused>() {
-        paused.to_string()
+        format!("{}\n{}", local_notice(paused.retry_at), paused.message)
     } else {
         format!("Erro: {error:#}")
     }
@@ -91,7 +91,9 @@ mod tests {
     use chrono::{Duration, FixedOffset};
 
     fn utc(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value).unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     #[test]
@@ -127,7 +129,10 @@ mod tests {
             assert!(text.ends_with("Tempo restante: 0 segundos."));
         }
         assert_eq!(remaining(now + Duration::nanoseconds(1), now), "1 segundo");
-        assert_eq!(remaining(now + Duration::milliseconds(1001), now), "2 segundos");
+        assert_eq!(
+            remaining(now + Duration::milliseconds(1001), now),
+            "2 segundos"
+        );
     }
 
     #[test]
@@ -138,7 +143,10 @@ mod tests {
             remaining(deadline, now),
             "1 dia, 1 hora, 1 minuto e 1 segundo"
         );
-        assert_eq!(remaining(deadline, now + Duration::seconds(90001)), "1 minuto");
+        assert_eq!(
+            remaining(deadline, now + Duration::seconds(90001)),
+            "1 minuto"
+        );
         assert_eq!(remaining(now + Duration::days(2), now), "2 dias");
         assert_eq!(remaining(now + Duration::hours(2), now), "2 horas");
     }
@@ -147,8 +155,8 @@ mod tests {
     fn system_timezone_and_wrapped_errors_use_shared_presentation() {
         let deadline = Utc::now() + Duration::hours(1);
         let local = deadline.with_timezone(&Local);
-        let error = anyhow::Error::new(CooldownActive { retry_at: deadline })
-            .context("outer context");
+        let error =
+            anyhow::Error::new(CooldownActive { retry_at: deadline }).context("outer context");
         let text = error_message(&error);
         assert!(text.contains(&local.format("%d/%m/%Y às %H:%M:%S (UTC%:z)").to_string()));
         assert!(text.ends_with("Nenhuma requisição foi enviada."));
