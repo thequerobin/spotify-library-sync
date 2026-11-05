@@ -2,6 +2,8 @@
 
 ## Próxima versão
 
+- Álbuns salvos aceitam datas fora de ordem, inclusive para IDs novos, preservando a parada por páginas conhecidas, conferência de páginas, duplicados e retomada.
+
 - Pausas por ordem incompatível informam coleção, página, ID, datas UTC e classificação na referência, sem iniciar uma conferência completa.
 - Incremental reconhece mudanças de data de IDs já confirmados antes de validar a ordem, atualiza a data sem duplicar itens e continua até páginas sem alterações.
 - Checkpoints conservam a referência temporal dos demais itens; retomada, conferência de páginas e publicação atômica permanecem ativas para músicas e álbuns.

@@ -520,7 +520,7 @@ async fn unknown_item_out_of_order_never_publishes_or_advances_frontier() -> Res
 }
 
 #[tokio::test]
-async fn unchanged_album_out_of_order_reports_collection_and_baseline_classification() -> Result<()>
+async fn unchanged_albums_can_be_out_of_date_order_and_still_stop_after_known_pages() -> Result<()>
 {
     let (_dir, mut db) = setup(0, 150).await?;
     let mut api = Library::new(0, 150);
@@ -530,15 +530,62 @@ async fn unchanged_album_out_of_order_reports_collection_and_baseline_classifica
         .execute(&mut db)
         .await?;
     let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
+    sync::run(&mut db, &mut api, &job, 30).await?;
+    let pages: Vec<_> = api
+        .calls
+        .iter()
+        .filter(|(path, _)| path == "/me/albums")
+        .map(|(_, offset)| *offset)
+        .collect();
+    assert_eq!(pages, vec![0, 50]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_saved_album_with_newer_date_inside_page_is_imported_without_full_scan(
+) -> Result<()> {
+    let (_dir, mut db) = setup(0, 300).await?;
+    let mut api = Library::new(0, 300);
+    api.albums.insert(
+        10,
+        album("0AkfypBArnKR3UN29f7U7u", "2026-11-05T16:49:41.000Z"),
+    );
+    api.albums
+        .insert(9, album("Earlier", "2026-11-05T10:26:25.000Z"));
+    let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
+    let summary = sync::run(&mut db, &mut api, &job, 30).await?;
+    assert_eq!(summary["coverage"], "recent_window");
+    let row = sqlx::query("SELECT saved_at,is_saved FROM album WHERE id='0AkfypBArnKR3UN29f7U7u'")
+        .fetch_one(&mut db)
+        .await?;
+    assert_eq!(row.get::<String, _>("saved_at"), "2026-11-05T16:49:41.000Z");
+    assert_eq!(row.get::<i64, _>("is_saved"), 1);
+    let pages: Vec<_> = api
+        .calls
+        .iter()
+        .filter(|(path, _)| path == "/me/albums")
+        .map(|(_, offset)| *offset)
+        .collect();
+    assert_eq!(pages, vec![0, 50, 100, 0]);
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM album WHERE is_saved=1").await?,
+        302
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unordered_albums_still_reject_duplicate_ids_across_pages() -> Result<()> {
+    let (_dir, mut db) = setup(0, 300).await?;
+    let mut api = Library::new(0, 300);
+    api.albums.insert(10, album("New", NEW));
+    api.albums[50] = api.albums[10].clone();
+    let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
     let error = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
     assert_eq!(
         error.downcast_ref::<WorkPaused>().unwrap().reason,
-        "ordering_inconclusive"
+        "window_changed"
     );
-    let diagnostic = error.to_string();
-    assert!(diagnostic.contains("Coleção: álbuns salvos"));
-    assert!(diagnostic.contains("ID: A000010"));
-    assert!(diagnostic.contains("ID confirmado, com a mesma data"));
     assert_eq!(
         count(
             &mut db,
@@ -546,6 +593,37 @@ async fn unchanged_album_out_of_order_reports_collection_and_baseline_classifica
         )
         .await?,
         0
+    );
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM album WHERE is_saved=1").await?,
+        300
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unordered_albums_revalidate_pages_when_resuming() -> Result<()> {
+    let (_dir, mut db) = setup(0, 300).await?;
+    let mut api = Library::new(0, 300);
+    api.albums.insert(10, album("New", NEW));
+    api.fail_at = Some(2);
+    let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
+    let error = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    sync::record_error(&mut db, &job, &error).await?;
+    api.fail_at = None;
+    api.albums.insert(0, album("Concurrent", NEW));
+    sync::prepare_sync(&mut db, true, &Options::default()).await?;
+    let error = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<WorkPaused>().unwrap().reason,
+        "window_changed"
+    );
+    sync::record_error(&mut db, &job, &error).await?;
+    sync::prepare_sync(&mut db, true, &Options::default()).await?;
+    sync::run(&mut db, &mut api, &job, 30).await?;
+    assert_eq!(
+        count(&mut db, "SELECT COUNT(*) FROM album WHERE is_saved=1").await?,
+        302
     );
     Ok(())
 }

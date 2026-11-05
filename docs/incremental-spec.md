@@ -109,7 +109,7 @@ Comparar identidade e data antes da validação temporal. Um ID confirmado na re
 
 Na retomada, reconstruir a última referência temporal pela menor data das observações já gravadas que não sejam atualizações de data de IDs confirmados. Essas observações seguem a ordem decrescente verificada pela coleta. Isso evita herdar de versões anteriores um `previous_added_at` baseado em data mutável, sem refazer chamadas de dados nem descartar o progresso.
 
-Se a ordem dos demais itens observados deixar de ser compatível com adições recentes no início, ou os dados não permitirem avaliar as fronteiras, publicar apenas metadados de catálogo e pausar a descoberta com cobertura inconclusiva. Informar a necessidade de revisão ou reconciliação explícita. Não certificar completude nem consumir a biblioteca inteira como fallback. IDs repetidos e mudanças nas assinaturas das páginas continuam invalidando a janela, mesmo quando a data de um ID foi atualizada.
+Para músicas curtidas, se a ordem dos demais itens observados deixar de ser compatível com adições recentes no início, ou os dados não permitirem avaliar as fronteiras, publicar apenas metadados de catálogo e pausar a descoberta com cobertura inconclusiva. Informar a necessidade de revisão ou reconciliação explícita. Não certificar completude nem consumir a biblioteca inteira como fallback. IDs repetidos e mudanças nas assinaturas das páginas continuam invalidando a janela, mesmo quando a data de um ID foi atualizada.
 
 ## 5. Publicação dos estados
 
@@ -299,3 +299,7 @@ Essas contagens são metas verificáveis em testes com dados estáveis, não uma
 ## 14. Entrega da implementação futura
 
 Entregar migrations compatíveis, CLI atualizada, testes, documentação e build Windows x64. Demonstrar em log o modo escolhido, a cobertura, o motivo da parada e a quantidade real de requisições. Não considerar concluído se o comando normal ainda percorrer a biblioteca inteira após uma importação inicial válida.
+
+### Atualização: ordenação dos álbuns salvos
+
+A coleta de álbuns não exige ordem decrescente de `added_at`, mesmo para IDs ausentes da referência. Esses IDs são novidades e reiniciam a contagem de páginas sem alterações. Permanecem a comparação de IDs/datas, a rejeição de IDs repetidos e as conferências de assinaturas, limites e retomada. Usar `page_signatures_and_known_ids` em `ordering_observed` para álbuns; a política temporal das músicas permanece separada. A cobertura de janela recente continua heurística e não certifica alterações fora das páginas consultadas.
