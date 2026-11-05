@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use spotify_library_sync::{
     auth::Auth,
     config::Config,
-    database,
+    database, discography,
     spotify::{Api, Spotify},
     sync,
 };
@@ -29,7 +29,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Autenticar com PKCE; tokens no cofre do sistema.
-    Login,
+    Login {
+        /// Também autorizar a leitura dos artistas seguidos.
+        #[arg(long)]
+        discography: bool,
+    },
+    /// Importar o catálogo dos artistas que você segue.
+    Discography {
+        #[command(subcommand)]
+        command: DiscographyCommand,
+    },
     /// Remover credenciais locais.
     Logout,
     /// Sincronizar sem modificar a biblioteca no Spotify.
@@ -86,6 +95,40 @@ enum Command {
         artist: Option<String>,
         #[command(flatten)]
         filters: Filters,
+    },
+}
+#[derive(Subcommand)]
+enum DiscographyCommand {
+    /// Sincronizar seguidos, descobrir lançamentos e importar as faixas pendentes.
+    Sync {
+        #[command(flatten)]
+        options: discography::Options,
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Importar apenas faixas pendentes usando a última lista confirmada de seguidos.
+    Tracks {
+        #[command(flatten)]
+        options: discography::Options,
+        #[arg(long)]
+        resume: bool,
+    },
+    Status,
+    /// Arquivar o job pendente, preservando o catálogo e a fila compartilhada de álbuns.
+    Restart,
+    Artists {
+        #[arg(long,default_value_t=100,value_parser=clap::value_parser!(u32).range(1..=5000))]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    Albums {
+        #[arg(long)]
+        artist: String,
+        #[arg(long,default_value_t=100,value_parser=clap::value_parser!(u32).range(1..=5000))]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
     },
 }
 #[derive(Args)]
@@ -164,17 +207,30 @@ async fn execute(cli: Cli) -> Result<()> {
         .create(true)
         .truncate(false)
         .open(absolute.with_extension("lockfile"))?;
-    if matches!(
+    let disc_mutates = matches!(
         &cli.command,
-        Command::Sync { .. } | Command::CheckSaved { .. } | Command::Login | Command::Logout
-    ) {
+        Command::Discography {
+            command: DiscographyCommand::Sync { .. }
+                | DiscographyCommand::Tracks { .. }
+                | DiscographyCommand::Restart
+        }
+    );
+    if disc_mutates
+        || matches!(
+            &cli.command,
+            Command::Sync { .. }
+                | Command::CheckSaved { .. }
+                | Command::Login { .. }
+                | Command::Logout
+        )
+    {
         lock.try_lock_exclusive()
             .context("Outra instância está usando este banco")?;
     }
     let mut db = database::open(&absolute).await?;
     match cli.command {
-        Command::Login => {
-            let auth = Auth::login(&cli.config).await?;
+        Command::Login { discography } => {
+            let auth = Auth::login_with_discography(&cli.config, discography).await?;
             let mut api = Spotify::new(auth, cli.config.request_interval_ms)?;
             let profile = match api.get("/me", None).await {
                 Ok(profile) => profile,
@@ -190,6 +246,27 @@ async fn execute(cli: Cli) -> Result<()> {
             api.auth.persist()?;
             println!("Autenticação concluída para {id}. Execute spotify-sync sync.");
         }
+        Command::Discography { command } => match command {
+            DiscographyCommand::Sync { options, resume } => {
+                run_discography(&mut db, &cli.config, options, resume, "sync").await?
+            }
+            DiscographyCommand::Tracks { options, resume } => {
+                run_discography(&mut db, &cli.config, options, resume, "tracks").await?
+            }
+            DiscographyCommand::Status => print_json(&discography::status(&mut db).await?)?,
+            DiscographyCommand::Restart => {
+                discography::restart(&mut db).await?;
+                println!("Job arquivado; catálogo e álbuns pendentes preservados.");
+            }
+            DiscographyCommand::Artists { limit, offset } => {
+                print_json(&discography::artists(&mut db, limit, offset).await?)?
+            }
+            DiscographyCommand::Albums {
+                artist,
+                limit,
+                offset,
+            } => print_json(&discography::albums(&mut db, &artist, limit, offset).await?)?,
+        },
         Command::Logout => {
             Auth::logout(&cli.config)?;
             println!("Credenciais locais removidas.");
@@ -369,6 +446,37 @@ async fn execute(cli: Cli) -> Result<()> {
                 .map(|r| serde_json::from_str(r.get("item")))
                 .collect();
             print_json(&json!(values?))?;
+        }
+    }
+    Ok(())
+}
+async fn run_discography(
+    db: &mut sqlx::SqliteConnection,
+    config: &Config,
+    options: discography::Options,
+    resume: bool,
+    kind: &str,
+) -> Result<()> {
+    sync::check_cooldown(db).await?;
+    let auth = Auth::load(config)?;
+    if kind == "sync" && !auth.can_read_followed() {
+        bail!("Autorize a leitura de artistas seguidos com spotify-sync login --discography; depois repita este comando");
+    }
+    let job = discography::prepare(db, resume, kind, options).await?;
+    let mut api = Spotify::new(auth, config.request_interval_ms)?;
+    let result = tokio::select! {
+        result=discography::run(db,&mut api,&job)=>Some(result),
+        signal=tokio::signal::ctrl_c()=>{signal?;None},
+    };
+    match result {
+        Some(Ok(summary)) => print_json(&summary)?,
+        Some(Err(error)) => {
+            discography::record_error(db, &job, &error).await?;
+            return Err(error);
+        }
+        None => {
+            sqlx::query("UPDATE discografia_job SET status='paused',pause_reason='user',updated_at=? WHERE id=?").bind(database::now()).bind(&job).execute(&mut *db).await?;
+            println!("Discografia pausada. Continue com discography sync --resume.");
         }
     }
     Ok(())

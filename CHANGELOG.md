@@ -1,5 +1,16 @@
 # Alterações
 
+## 0.3.0 — 05/11/2026
+
+- Discografias exclusivamente dos artistas seguidos, com autorização opcional `login --discography`.
+- Filas persistentes de artistas e faixas, retomada por página e orçamento global de tentativas HTTP.
+- Cache por conta, mercado e filtro; álbuns compartilhados entre artistas sem importação repetida.
+- Primeira listagem completa, TTL de sete dias e atualizações recentes com referência congelada.
+- Lotes de 100 artistas por padrão, priorizando artistas nunca importados, e modo de descoberta sem faixas.
+- Consultas offline de seguidos e lançamentos, status de cobertura e fila separada da biblioteca.
+- Preservação de curtidas, álbuns salvos e catálogo de artistas não mais seguidos.
+- 22 testes adicionais, incluindo 1.000 artistas, mudanças concorrentes, orçamento, permissões e transporte HTTP.
+
 ## 0.2.1 — 05/11/2026
 
 - Importação completa retoma o offset pendente buscando referências por ID/data nas páginas próximas.

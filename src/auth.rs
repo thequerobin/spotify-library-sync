@@ -19,12 +19,15 @@ pub struct Tokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: i64,
+    scope: Option<String>,
 }
 
 pub struct Auth {
@@ -56,6 +59,7 @@ impl Auth {
                 access_token: "test-token".into(),
                 refresh_token: "test-refresh".into(),
                 expires_at: i64::MAX,
+                scope: Some("user-library-read user-follow-read".into()),
             },
             client_id: "test-client".into(),
             http: reqwest::Client::new(),
@@ -112,6 +116,9 @@ impl Auth {
         if let Some(refresh) = token.refresh_token {
             self.tokens.refresh_token = refresh;
         }
+        if let Some(scope) = token.scope {
+            self.tokens.scope = Some(scope);
+        }
         self.tokens.expires_at = Utc::now().timestamp() + token.expires_in - 30;
         self.persist()
     }
@@ -123,6 +130,20 @@ impl Auth {
     }
     /// Opens the browser only for this explicit login command. Persistence happens after account validation.
     pub async fn login(config: &Config) -> Result<Self> {
+        Self::login_with_discography(config, false).await
+    }
+    pub fn can_read_followed(&self) -> bool {
+        self.tokens.scope.as_deref().is_some_and(|s| {
+            s.split_whitespace()
+                .any(|scope| scope == "user-follow-read")
+        })
+    }
+    pub async fn login_with_discography(config: &Config, discography: bool) -> Result<Self> {
+        let scopes = if discography {
+            "user-library-read user-follow-read"
+        } else {
+            "user-library-read"
+        };
         let client_id = config.client_id()?.to_owned();
         let redirect = config.redirect()?;
         let listener = TcpListener::bind(("127.0.0.1", redirect.port().unwrap()))
@@ -135,7 +156,7 @@ impl Auth {
             ("client_id", client_id.as_str()),
             ("response_type", "code"),
             ("redirect_uri", config.redirect_uri.as_str()),
-            ("scope", "user-library-read"),
+            ("scope", scopes),
             ("code_challenge_method", "S256"),
             ("code_challenge", challenge(&verifier).as_str()),
             ("state", state.as_str()),
@@ -205,9 +226,32 @@ impl Auth {
                     .refresh_token
                     .context("Spotify não retornou refresh token")?,
                 expires_at: Utc::now().timestamp() + token.expires_in - 30,
+                scope: Some(token.scope.unwrap_or_else(|| scopes.to_owned())),
             },
             client_id,
             http,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn legacy_tokens_load_without_new_scope_field() {
+        let tokens: Tokens = serde_json::from_str(
+            r#"{"access_token":"test","refresh_token":"test","expires_at":1}"#,
+        )
+        .unwrap();
+        assert!(tokens.scope.is_none());
+    }
+    #[test]
+    fn followed_permission_is_explicit_and_matches_a_complete_scope_name() {
+        let mut auth = Auth::for_test();
+        assert!(auth.can_read_followed());
+        auth.tokens.scope = Some("user-library-read user-follow-read-extra".into());
+        assert!(!auth.can_read_followed());
+        auth.tokens.scope = None;
+        assert!(!auth.can_read_followed());
     }
 }

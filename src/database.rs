@@ -134,6 +134,20 @@ async fn catalog(
     Ok(v)
 }
 
+pub async fn artist(db: &mut SqliteConnection, incoming: &Value) -> Result<String> {
+    let id = identity(incoming)?;
+    let value = catalog(db, "artista", &id, incoming).await?;
+    sqlx::query("UPDATE artista SET name=?,spotify_uri=?,spotify_url=?,href=? WHERE id=?")
+        .bind(text(&value, "/name"))
+        .bind(text(&value, "/uri"))
+        .bind(text(&value, "/external_urls/spotify"))
+        .bind(text(&value, "/href"))
+        .bind(&id)
+        .execute(db)
+        .await?;
+    Ok(id)
+}
+
 async fn artists(db: &mut SqliteConnection, table: &str, parent: &str, v: &Value) -> Result<()> {
     let Some(items) = v.get("artists").and_then(Value::as_array) else {
         return Ok(());
@@ -153,16 +167,7 @@ async fn artists(db: &mut SqliteConnection, table: &str, parent: &str, v: &Value
         .execute(&mut *db)
         .await?;
     for (position, item) in items.iter().enumerate() {
-        let id = identity(item)?;
-        let a = catalog(db, "artista", &id, item).await?;
-        sqlx::query("UPDATE artista SET name=?,spotify_uri=?,spotify_url=?,href=? WHERE id=?")
-            .bind(text(&a, "/name"))
-            .bind(text(&a, "/uri"))
-            .bind(text(&a, "/external_urls/spotify"))
-            .bind(text(&a, "/href"))
-            .bind(&id)
-            .execute(&mut *db)
-            .await?;
+        let id = artist(db, item).await?;
         sqlx::query(&format!("INSERT OR REPLACE INTO {link} VALUES(?,?,?)"))
             .bind(parent)
             .bind(id)

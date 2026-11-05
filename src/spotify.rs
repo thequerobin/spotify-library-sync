@@ -53,6 +53,27 @@ pub trait Api: Send {
     async fn contains(&mut self, _uris: &[String]) -> Result<Value> {
         bail!("Consulta contains não suportada por este cliente")
     }
+    async fn followed_artists(&mut self, _after: Option<&str>) -> Result<Value> {
+        bail!("Consulta de artistas seguidos não suportada")
+    }
+    async fn artist_albums(
+        &mut self,
+        _artist: &str,
+        _offset: i64,
+        _groups: &str,
+        _market: Option<&str>,
+    ) -> Result<Value> {
+        bail!("Consulta de discografia não suportada")
+    }
+    async fn album_tracks(
+        &mut self,
+        album: &str,
+        offset: i64,
+        _market: Option<&str>,
+    ) -> Result<Value> {
+        self.get(&format!("/albums/{album}/tracks"), Some(offset))
+            .await
+    }
     fn set_budget(&mut self, _remaining: Option<u32>) {}
     fn attempt_count(&self) -> u64 {
         0
@@ -223,6 +244,50 @@ impl Api for Spotify {
         self.request("/me/library/contains", &[("uris", uris.join(","))])
             .await
     }
+    async fn followed_artists(&mut self, after: Option<&str>) -> Result<Value> {
+        let mut params = vec![("type", "artist".to_owned()), ("limit", "50".to_owned())];
+        if let Some(after) = after {
+            params.push(("after", after.to_owned()));
+        }
+        self.request("/me/following", &params).await
+    }
+    async fn artist_albums(
+        &mut self,
+        artist: &str,
+        offset: i64,
+        groups: &str,
+        market: Option<&str>,
+    ) -> Result<Value> {
+        if artist.is_empty() || !artist.bytes().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("ID de artista inválido");
+        }
+        let mut params = vec![
+            ("limit", "10".to_owned()),
+            ("offset", offset.to_string()),
+            ("include_groups", groups.to_owned()),
+        ];
+        if let Some(market) = market {
+            params.push(("market", market.to_owned()));
+        }
+        self.request(&format!("/artists/{artist}/albums"), &params)
+            .await
+    }
+    async fn album_tracks(
+        &mut self,
+        album: &str,
+        offset: i64,
+        market: Option<&str>,
+    ) -> Result<Value> {
+        if album.is_empty() || !album.bytes().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("ID de álbum inválido");
+        }
+        let mut params = vec![("limit", "50".to_owned()), ("offset", offset.to_string())];
+        if let Some(market) = market {
+            params.push(("market", market.to_owned()));
+        }
+        self.request(&format!("/albums/{album}/tracks"), &params)
+            .await
+    }
     fn set_budget(&mut self, remaining: Option<u32>) {
         self.budget_remaining = remaining;
     }
@@ -353,6 +418,70 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, false])
         );
+        handle.await.unwrap();
+    }
+    #[tokio::test]
+    async fn discography_endpoints_use_correct_pagination_and_encoded_filters() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            for expected in [
+                "/me/following",
+                "/artists/Artist/albums",
+                "/albums/Album/tracks",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 8192];
+                let n = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]);
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token"));
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let parsed = url::Url::parse(&format!("http://local{target}")).unwrap();
+                assert_eq!(parsed.path(), expected);
+                let query: std::collections::HashMap<_, _> = parsed
+                    .query_pairs()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                match expected {
+                    "/me/following" => {
+                        assert_eq!(query["limit"], "50");
+                        assert_eq!(query["type"], "artist");
+                        assert_eq!(query["after"], "LastArtist");
+                    }
+                    "/artists/Artist/albums" => {
+                        assert_eq!(query["limit"], "10");
+                        assert_eq!(query["offset"], "20");
+                        assert_eq!(query["include_groups"], "album,single");
+                        assert_eq!(query["market"], "BR");
+                    }
+                    _ => {
+                        assert_eq!(query["limit"], "50");
+                        assert_eq!(query["offset"], "50");
+                        assert_eq!(query["market"], "BR");
+                    }
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut api = client(base).await;
+        api.followed_artists(Some("LastArtist")).await.unwrap();
+        api.artist_albums("Artist", 20, "album,single", Some("BR"))
+            .await
+            .unwrap();
+        api.album_tracks("Album", 50, Some("BR")).await.unwrap();
         handle.await.unwrap();
     }
     fn json_value() -> Value {
