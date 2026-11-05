@@ -435,6 +435,48 @@ async fn reset_artist(db: &mut SqliteConnection, job: &str, id: &str) -> Result<
         .bind(job).bind(id).execute(db).await?;
     Ok(())
 }
+// Artist releases may contain fewer items than the requested ten positions.
+// Follow the cursor advertised by Spotify, never an API-supplied URL itself.
+fn release_next(page: &Page, artist: &str, offset: i64, total: Option<i64>) -> Result<Option<i64>> {
+    if page.offset != offset
+        || offset < 0
+        || page.total < 0
+        || total.is_some_and(|n| n != page.total)
+        || page.items.len() > 10
+        || (page.total > 0 && offset >= page.total)
+    {
+        bail!("Offset, total ou quantidade inválidos");
+    }
+    let boundary = offset
+        .checked_add(10)
+        .context("Offset excedeu o intervalo válido")?;
+    if let Some(next) = &page.next {
+        let url = url::Url::parse(next).context("Cursor next inválido")?;
+        let offsets: Vec<_> = url.query_pairs().filter(|(k, _)| k == "offset").collect();
+        let next_offset = offsets.first().and_then(|(_, v)| v.parse::<i64>().ok());
+        if url.scheme() != "https"
+            || url.host_str() != Some("api.spotify.com")
+            || url.path() != format!("/v1/artists/{artist}/albums")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || offsets.len() != 1
+            || next_offset != Some(boundary)
+            || boundary >= page.total
+        {
+            bail!("Cursor next incompatível com a página solicitada");
+        }
+        Ok(next_offset)
+    } else {
+        if boundary < page.total
+            || offset > page.total
+            || page.items.len() as i64 > page.total - offset
+        {
+            bail!("Fim da paginação incompatível com o total");
+        }
+        Ok(None)
+    }
+}
 async fn listings<A: Api>(db: &mut SqliteConnection, rt: &mut Runtime<'_, A>) -> Result<()> {
     loop {
         let row=sqlx::query("SELECT * FROM discografia_artista_queue WHERE job_id=? AND state<>'completed' ORDER BY artista_id LIMIT 1").bind(&rt.job).fetch_optional(&mut *db).await?;
@@ -452,20 +494,24 @@ async fn listings<A: Api>(db: &mut SqliteConnection, rt: &mut Runtime<'_, A>) ->
             return Ok(());
         };
         let artist: String = row.get("artista_id");
-        let offset: i64 = row.get("next_offset");
+        let mut offset: i64 = row.get("next_offset");
         let expected: Option<i64> = row.get("total_items");
         let previous: Option<i64> = row.get("previous_offset");
         if rt.revalidated.insert(artist.clone()) && offset > 0 {
             if let Some(previous) = previous {
                 let page: Page =
                     serde_json::from_value(rt.fetch(db, Call::Releases(&artist, previous)).await?)?;
-                if page.validate(previous, expected).is_err()
+                if release_next(&page, &artist, previous, expected).is_err()
                     || Some(listing_fingerprint(&page)?)
                         != row.get::<Option<String>, _>("previous_fingerprint")
                 {
                     reset_artist(db, &rt.job, &artist).await?;
                     return Err(paused("artist_catalog_changed","A paginação mudou para um artista. Apenas sua listagem foi reposicionada; retome a discografia."));
                 }
+                // Repair checkpoints written by versions that advanced by the
+                // number of returned releases instead of the server cursor.
+                offset = release_next(&page, &artist, previous, expected)?
+                    .context("Artista pendente sem próxima página")?;
             }
         }
         let page: Page =
@@ -473,13 +519,15 @@ async fn listings<A: Api>(db: &mut SqliteConnection, rt: &mut Runtime<'_, A>) ->
         if page.items.len() > 10 {
             bail!("Endpoint de discografia retornou mais de 10 lançamentos por página");
         }
-        let end = match page.validate(offset, expected) {
+        let next_offset = match release_next(&page, &artist, offset, expected) {
             Ok(v) => v,
-            Err(_) => {
+            Err(error) => {
                 reset_artist(db, &rt.job, &artist).await?;
-                return Err(paused("artist_catalog_changed","Total ou paginação de um artista mudou. Outros artistas foram preservados; retome a discografia."));
+                return Err(paused("artist_catalog_changed", &format!("Paginação inconsistente do artista {artist}. Offset solicitado: {offset}; recebido: {}; total esperado: {expected:?}; recebido: {}; itens: {}; next: {:?}. Causa: {error}. Outros artistas foram preservados; retome a discografia.", page.offset, page.total, page.items.len(), page.next)));
             }
         };
+        let end = next_offset.is_none();
+        let cursor = next_offset.unwrap_or(page.total);
         let contexts =
             sqlx::query("SELECT catalog_context,album_context FROM discografia_job WHERE id=?")
                 .bind(&rt.job)
@@ -519,7 +567,7 @@ async fn listings<A: Api>(db: &mut SqliteConnection, rt: &mut Runtime<'_, A>) ->
         let finished = end || (mode == "recent" && consecutive >= 2);
         let coverage = if end { "full_listing" } else { "recent_window" };
         sqlx::query("UPDATE discografia_artista_queue SET state=?,next_offset=?,total_items=?,previous_offset=?,previous_fingerprint=?,known_pages=?,pages_processed=pages_processed+1,stop_reason=?,last_error=NULL WHERE job_id=? AND artista_id=?")
-            .bind(if finished{"completed"}else{"running"}).bind(offset+page.items.len() as i64).bind(page.total).bind(offset).bind(listing_fingerprint(&page)?).bind(consecutive)
+            .bind(if finished{"completed"}else{"running"}).bind(cursor).bind(page.total).bind(offset).bind(listing_fingerprint(&page)?).bind(consecutive)
             .bind(if end{Some("end_of_catalog")}else if finished{Some("known_pages")}else{None}).bind(&rt.job).bind(&artist).execute(&mut *tx).await?;
         if finished {
             sqlx::query("INSERT INTO discografia_cache(artista_id,catalog_context,last_checked_at,last_full_at,coverage,last_job_id) VALUES(?,?,?,?,?,?) ON CONFLICT(artista_id,catalog_context) DO UPDATE SET last_checked_at=excluded.last_checked_at,last_full_at=COALESCE(excluded.last_full_at,discografia_cache.last_full_at),coverage=excluded.coverage,last_job_id=excluded.last_job_id,needs_full_refresh=0")
@@ -527,11 +575,8 @@ async fn listings<A: Api>(db: &mut SqliteConnection, rt: &mut Runtime<'_, A>) ->
         }
         tx.commit().await?;
         eprintln!(
-            "Discografia {artist}: lançamentos {}/{}, modo {mode}; requisições {}/{}",
-            offset + page.items.len() as i64,
-            page.total,
-            rt.used,
-            rt.limit
+            "Discografia {artist}: posição {}/{}, modo {mode}; requisições {}/{}",
+            cursor, page.total, rt.used, rt.limit
         );
     }
 }
