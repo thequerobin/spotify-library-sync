@@ -2,6 +2,8 @@
 
 ## Próxima versão
 
+- Incremental reconhece mudanças de data de IDs já confirmados antes de validar a ordem, atualiza a data sem duplicar itens e continua até páginas sem alterações.
+- Checkpoints conservam a referência temporal dos demais itens; retomada, conferência de páginas e publicação atômica permanecem ativas para músicas e álbuns.
 - Avisos de rate limit no fuso local do sistema, com data, hora, deslocamento UTC e tempo restante atualizado.
 - Apresentação compartilhada entre menu/CMD, comandos, HTTP 429 e QUOTA_EXCEEDED; cooldown e status persistidos em UTC.
 - Testes de fusos, virada de data, vencimento, arredondamento, bloqueio persistido e seleção local durante cooldown.

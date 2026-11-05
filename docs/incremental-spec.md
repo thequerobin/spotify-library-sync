@@ -105,7 +105,9 @@ Se o cabeçalho mudar durante a coleta:
 
 Na validação incremental, variação no `total` não deve, isoladamente, acionar o erro global `Unstable` da implementação atual. O total é um sinal de possível mudança, não um snapshot.
 
-Se a ordem observada deixar de ser compatível com adições recentes no início, ou os dados não permitirem avaliar as fronteiras, publicar apenas metadados de catálogo e pausar a descoberta com cobertura inconclusiva. Informar a necessidade de revisão ou reconciliação explícita. Não certificar completude nem consumir a biblioteca inteira como fallback.
+Comparar identidade e data antes da validação temporal. Um ID confirmado na referência congelada com `added_at` diferente, inclusive quando a data anterior é nula, representa uma atualização do mesmo item. Registrar a nova data candidata, reiniciar a contagem de páginas conhecidas e continuar a busca. Essa data mutável fica fora da comparação temporal entre vizinhos e não substitui `previous_added_at` no checkpoint. A publicação continua atômica por coleção, incluindo após interrupção e retomada. Registrar a política como `descending_except_date_updates` em `ordering_observed`.
+
+Se a ordem dos demais itens observados deixar de ser compatível com adições recentes no início, ou os dados não permitirem avaliar as fronteiras, publicar apenas metadados de catálogo e pausar a descoberta com cobertura inconclusiva. Informar a necessidade de revisão ou reconciliação explícita. Não certificar completude nem consumir a biblioteca inteira como fallback. IDs repetidos e mudanças nas assinaturas das páginas continuam invalidando a janela, mesmo quando a data de um ID foi atualizada.
 
 ## 5. Publicação dos estados
 

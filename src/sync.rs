@@ -239,7 +239,7 @@ async fn publish(db: &mut SqliteConnection, job: &str, kind: &str) -> Result<()>
     let table = if kind == "track" { "musica" } else { "album" };
     let published=sqlx::query(&format!("UPDATE {table} SET is_saved=1,saved_at=(SELECT saved_at FROM sync_seen_item WHERE job_id=? AND item_type=? AND item_id={table}.id),last_seen_saved_sync=?,updated_at=? WHERE id IN(SELECT item_id FROM sync_seen_item WHERE job_id=? AND item_type=?)"))
         .bind(job).bind(kind).bind(job).bind(now()).bind(job).bind(kind).execute(&mut *tx).await?.rows_affected();
-    sqlx::query("UPDATE library_sync_state SET last_incremental_completed_at=?,last_coverage='recent_window',last_successful_job_id=?,head_signature=?,remote_total_last_seen=?,ordering_observed='descending_in_window',watermark_added_at=MAX(COALESCE(watermark_added_at,''),COALESCE((SELECT MAX(saved_at) FROM sync_seen_item WHERE job_id=? AND item_type=?),'')) WHERE collection=?")
+    sqlx::query("UPDATE library_sync_state SET last_incremental_completed_at=?,last_coverage='recent_window',last_successful_job_id=?,head_signature=?,remote_total_last_seen=?,ordering_observed='descending_except_date_updates',watermark_added_at=MAX(COALESCE(watermark_added_at,''),COALESCE((SELECT MAX(saved_at) FROM sync_seen_item WHERE job_id=? AND item_type=?),'')) WHERE collection=?")
         .bind(now()).bind(job).bind(scope.get::<Option<String>,_>("head_signature")).bind(scope.get::<Option<i64>,_>("observed_total")).bind(job).bind(kind).bind(kind).execute(&mut *tx).await?;
     sqlx::query(
         "UPDATE sync_scope SET state='published',published_items=? WHERE job_id=? AND collection=?",
@@ -338,13 +338,28 @@ async fn incremental_collection<A: Api>(
             let object = &item[if kind == "track" { "track" } else { "album" }];
             let id = database::identity(object)?;
             let date = legacy_sync::saved_at(item)?;
-            if last.as_ref().is_some_and(|old| date > *old) {
-                return Err(WorkPaused{reason:"ordering_inconclusive",message:"Ordem da janela recente incompatível com adições no início. Estados preservados; use --reconcile para uma verificação completa explícita.".into()}.into());
+            let baseline: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT saved_at FROM sync_baseline_item WHERE job_id=? AND collection=? AND item_id=?",
+            )
+            .bind(job)
+            .bind(kind)
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let unchanged = baseline
+                .as_ref()
+                .is_some_and(|saved| saved.as_deref() == Some(date.as_str()));
+            // A confirmed ID with a different date is an update, even if its date
+            // no longer follows the surrounding items. Do not let that mutable
+            // date become the ordering reference for the next item or checkpoint.
+            let date_changed = baseline.is_some() && !unchanged;
+            if !date_changed {
+                if last.as_ref().is_some_and(|old| date > *old) {
+                    return Err(WorkPaused{reason:"ordering_inconclusive",message:"Ordem da janela recente incompatível com adições no início. Estados preservados; use --reconcile para uma verificação completa explícita.".into()}.into());
+                }
+                last = Some(date.clone());
             }
-            last = Some(date.clone());
-            let baseline:Option<String>=sqlx::query_scalar("SELECT saved_at FROM sync_baseline_item WHERE job_id=? AND collection=? AND item_id=?")
-                .bind(job).bind(kind).bind(&id).fetch_optional(&mut *tx).await?.flatten();
-            if baseline.as_deref() != Some(date.as_str()) {
+            if !unchanged {
                 wholly_known = false;
                 page_changes += 1;
             }

@@ -202,6 +202,156 @@ async fn relike_date_is_updated_even_for_an_existing_saved_id() -> Result<()> {
         .fetch_one(&mut db)
         .await?;
     assert_eq!(date, NEW);
+    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM musica").await?, 150);
+    let pages: Vec<_> = api
+        .calls
+        .iter()
+        .filter(|(path, _)| path == "/me/tracks")
+        .map(|(_, offset)| *offset)
+        .collect();
+    assert_eq!(pages, vec![0, 50, 100, 0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_dates_update_tracks_and_albums_without_requiring_chronological_order() -> Result<()>
+{
+    let (_dir, mut db) = setup(300, 300).await?;
+    let mut api = Library::new(300, 300);
+    let older = "2026-09-01T00:00:00.000Z";
+    // Include a confirmed ID with a previously unknown date.
+    sqlx::query("UPDATE album SET saved_at=NULL WHERE id='A000050'")
+        .execute(&mut db)
+        .await?;
+    for items in [&mut api.tracks, &mut api.albums] {
+        items[10]["added_at"] = json!(NEW);
+        items[49]["added_at"] = json!(older);
+        items[50]["added_at"] = json!(NEW);
+    }
+    let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
+    let summary = sync::run(&mut db, &mut api, &job, 30).await?;
+    assert_eq!(summary["coverage"], "recent_window");
+    for (table, prefix, endpoint) in [("musica", "T", "/me/tracks"), ("album", "A", "/me/albums")] {
+        for (index, expected) in [(10, NEW), (49, older), (50, NEW)] {
+            let row = sqlx::query(&format!("SELECT saved_at,is_saved FROM {table} WHERE id=?"))
+                .bind(format!("{prefix}{index:06}"))
+                .fetch_one(&mut db)
+                .await?;
+            assert_eq!(row.get::<String, _>("saved_at"), expected);
+            assert_eq!(row.get::<i64, _>("is_saved"), 1);
+        }
+        assert_eq!(
+            count(
+                &mut db,
+                &format!("SELECT COUNT(*) FROM {table} WHERE is_saved=1")
+            )
+            .await?,
+            300
+        );
+        let pages: Vec<_> = api
+            .calls
+            .iter()
+            .filter(|(path, _)| path == endpoint)
+            .map(|(_, offset)| *offset)
+            .collect();
+        // Both changed pages reset the known-page counter. No full scan occurs.
+        assert_eq!(pages, vec![0, 50, 100, 150, 0]);
+    }
+    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM musica").await?, 300);
+    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM album").await?, 301);
+    assert!(api
+        .calls
+        .iter()
+        .all(|(path, _)| !path.starts_with("/albums/")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_date_at_page_boundary_survives_interruption_and_resume() -> Result<()> {
+    let (dir, mut db) = setup(300, 0).await?;
+    let mut api = Library::new(300, 0);
+    let older = "2026-09-01T00:00:00.000Z";
+    api.tracks[49]["added_at"] = json!(older);
+    api.tracks[50]["added_at"] = json!(NEW);
+    api.fail_at = Some(1);
+    let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
+    let error = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    assert!(error.to_string().contains("simulated network failure"));
+    sync::record_error(&mut db, &job, &error).await?;
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT next_offset FROM sync_scope WHERE collection='track'"
+        )
+        .await?,
+        50
+    );
+    let previous: String =
+        sqlx::query_scalar("SELECT previous_added_at FROM sync_scope WHERE collection='track'")
+            .fetch_one(&mut db)
+            .await?;
+    assert_eq!(previous, OLD);
+    let date: String = sqlx::query_scalar("SELECT saved_at FROM musica WHERE id='T000049'")
+        .fetch_one(&mut db)
+        .await?;
+    assert_eq!(date, OLD, "an unfinished collection must not publish dates");
+    db.close().await?;
+
+    db = database::open(&dir.path().join("db.sqlite")).await?;
+    api.fail_at = None;
+    api.calls.clear();
+    assert_eq!(
+        sync::prepare_sync(&mut db, true, &Options::default()).await?,
+        job
+    );
+    sync::run(&mut db, &mut api, &job, 30).await?;
+    let pages: Vec<_> = api
+        .calls
+        .iter()
+        .filter(|(path, _)| path == "/me/tracks")
+        .map(|(_, offset)| *offset)
+        .collect();
+    assert_eq!(pages, vec![0, 50, 100, 150, 0]);
+    let dates: Vec<String> = sqlx::query_scalar(
+        "SELECT saved_at FROM musica WHERE id IN ('T000049','T000050') ORDER BY id",
+    )
+    .fetch_all(&mut db)
+    .await?;
+    assert_eq!(dates, vec![older.to_owned(), NEW.to_owned()]);
+    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM musica").await?, 300);
+    Ok(())
+}
+
+#[tokio::test]
+async fn relike_between_interruption_and_resume_revalidates_the_head() -> Result<()> {
+    let (_dir, mut db) = setup(300, 0).await?;
+    let mut api = Library::new(300, 0);
+    api.fail_at = Some(1);
+    let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
+    let error = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    sync::record_error(&mut db, &job, &error).await?;
+    api.fail_at = None;
+    let mut item = api.tracks.remove(200);
+    item["added_at"] = json!(NEW);
+    api.tracks.insert(0, item);
+    sync::prepare_sync(&mut db, true, &Options::default()).await?;
+    let error = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<WorkPaused>().unwrap().reason,
+        "window_changed"
+    );
+    sync::record_error(&mut db, &job, &error).await?;
+    sync::prepare_sync(&mut db, true, &Options::default()).await?;
+    sync::run(&mut db, &mut api, &job, 30).await?;
+    let date: String = sqlx::query_scalar("SELECT saved_at FROM musica WHERE id='T000200'")
+        .fetch_one(&mut db)
+        .await?;
+    assert_eq!(date, NEW);
+    assert_eq!(count(&mut db, "SELECT COUNT(*) FROM musica").await?, 300);
+    assert!(api
+        .calls
+        .iter()
+        .all(|(path, _)| path == "/me/tracks" || path == "/me/albums"));
     Ok(())
 }
 #[tokio::test]
@@ -327,10 +477,10 @@ async fn concurrent_head_edit_pauses_recent_window_and_never_runs_full_scan() ->
     Ok(())
 }
 #[tokio::test]
-async fn unsupported_order_and_malformed_page_never_publish_or_advance_frontier() -> Result<()> {
+async fn unknown_item_out_of_order_never_publishes_or_advances_frontier() -> Result<()> {
     let (_dir, mut db) = setup(150, 0).await?;
     let mut api = Library::new(150, 0);
-    api.tracks[10]["added_at"] = json!(NEW);
+    api.tracks[10] = track("UnknownOutOfOrder", NEW);
     let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
     let e = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
     assert_eq!(

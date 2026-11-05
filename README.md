@@ -57,9 +57,13 @@ Reconciliação completa nunca é iniciada automaticamente por TTL vencido, redu
 
 O programa congela uma referência dos IDs e datas já confirmados no SQLite, consulta páginas de até 50 itens e para após duas páginas consecutivas inteiramente conhecidas, ou no fim da coleção. Itens cadastrados no catálogo, mas não confirmados como curtidos/salvos, não provocam essa parada. Datas iguais são comparadas juntamente com os IDs.
 
+Se um ID já confirmado reaparecer com outra data de adição (por exemplo, ao curtir novamente uma música), ele é tratado como alteração: a nova data substitui a anterior na publicação da coleção, sem duplicar o item. Isso também vale para álbuns salvos e datas anteriores desconhecidas. A página com essa alteração reinicia a contagem de páginas sem novidades; a coleta continua até a condição normal de parada. A data alterada não é usada para exigir ordem temporal dos itens vizinhos nem como referência temporal do checkpoint. A ordem dos demais itens e as conferências de páginas continuam sendo verificadas.
+
+Após Ctrl+C, use `sync --resume` ou a opção 3 do menu. A retomada preserva a referência anterior, revalida as páginas e publica as datas somente ao concluir a coleção. Para um job pausado pela versão anterior por uma mudança de data de um ID confirmado, atualize o executável e tente a mesma retomada; não é necessário apagar registros nem iniciar uma reconciliação completa por esse motivo.
+
 Não há segunda passagem integral no modo incremental. Quando necessário, há uma conferência adicional da primeira página. Numa base estável de 21.948 curtidas e mais de duas páginas de álbuns, sem novidades, retries ou faixas pendentes, a meta validada é **5 chamadas de dados**: uma de perfil, duas de curtidas e duas de álbuns. Cinco curtidas novas no início normalmente exigem até 7 chamadas contando as duas coleções e o perfil.
 
-A API não documenta um filtro `since` nem garante uma ordenação temporal nesses endpoints. A parada antecipada é uma heurística sobre a ordem observada. **A cobertura é da janela recente:** alterações antigas fora dela podem não aparecer. O programa não anuncia sincronização exata de toda a biblioteca nesse modo. Uma ordem incompatível pausa a coleta com cobertura inconclusiva; não dispara um full automático.
+A API não documenta um filtro `since` nem garante uma ordenação temporal nesses endpoints. A parada antecipada é uma heurística sobre a ordem observada. **A cobertura é da janela recente:** alterações antigas fora dela podem não aparecer. O programa não anuncia sincronização exata de toda a biblioteca nesse modo. Uma ordem incompatível entre itens sem mudança de data reconhecida pausa a coleta com cobertura inconclusiva; não dispara um full automático.
 
 ### Estados salvos, remoções e consultas
 
