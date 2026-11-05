@@ -108,3 +108,82 @@ fn another_process_cannot_open_locked_database() {
         "Status deve continuar disponível durante a sincronização"
     );
 }
+
+fn interactive(path: &Path, input: &str) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_spotify-sync"))
+        .arg("--database")
+        .arg(path)
+        .env_remove("SPOTIFY_CLIENT_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+#[test]
+fn menu_opens_without_arguments_handles_invalid_choice_and_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("menu.db");
+    let output = interactive(&path, "invalid\n11\n0\n");
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Opção inválida"));
+    assert!(text.contains("Criar LSUA"));
+    assert!(text.contains("Criar USSA"));
+    assert!(text.contains("liked_tracks"));
+    assert!(interactive(&path, "").status.success());
+}
+#[tokio::test]
+async fn local_playlist_preview_and_cancelled_menu_creation_need_no_credentials() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("menu.db");
+    let mut db = database::open(&path).await?;
+    database::album(&mut db, &json!({"id":"a","release_date":"2020"})).await?;
+    database::track(
+        &mut db,
+        &json!({"id":"t","uri":"spotify:track:t","name":"Song"}),
+        "a",
+    )
+    .await?;
+    sqlx::query("UPDATE musica SET is_saved=1,saved_at='2026-02-01T00:00:00Z'")
+        .execute(&mut db)
+        .await?;
+    db.close().await?;
+    let output = invoke(
+        &path,
+        &["playlist", "preview", "--kind", "lsua", "--from", "02/2026"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(preview["count"], 1);
+    assert_eq!(preview["name"], "LSUA - 02-2026");
+    let rejected = invoke(&path, &["playlist", "create", "--kind", "lsua", "--yes"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--allow-incomplete"));
+    let output = interactive(&path, "7\n\n\n\n\n\nn\n0\n");
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Criação cancelada"), "{text}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Credenciais"));
+    let mut db = database::open(&path).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM playlist_job")
+            .fetch_one(&mut db)
+            .await?,
+        0
+    );
+    Ok(())
+}

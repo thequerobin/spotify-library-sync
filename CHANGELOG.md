@@ -1,5 +1,16 @@
 # Alterações
 
+## 0.4.0 — 05/11/2026
+
+- Menu interativo no CMD ao executar sem argumentos; o iniciador Windows abre o menu.
+- Playlists LSUA e USSA, com nomenclatura do Spotifast e seleção exclusivamente no SQLite.
+- Períodos por adição ou lançamento, prévia, avisos de cobertura, nome e visibilidade editáveis.
+- Autorização opcional `login --playlists`, preservando o login de leitura existente.
+- Seleção congelada e envio em lotes persistentes; recuperação de criação/envio sem confirmação.
+- POSTs incertos não são repetidos automaticamente; retomada confere a playlist de destino sem buscar a biblioteca.
+- Comandos de prévia offline, criação, status e retomada; confirmação explícita para scripts.
+- 21 testes adicionais de seleção, filtros, menu, permissões, HTTP, orçamento e retomada.
+
 ## 0.3.0 — 05/11/2026
 
 - Discografias exclusivamente dos artistas seguidos, com autorização opcional `login --discography`.

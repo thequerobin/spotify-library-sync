@@ -139,11 +139,36 @@ impl Auth {
         })
     }
     pub async fn login_with_discography(config: &Config, discography: bool) -> Result<Self> {
-        let scopes = if discography {
-            "user-library-read user-follow-read"
+        Self::login_with_options(config, discography, false).await
+    }
+    pub fn can_create_playlists(&self, public: bool) -> bool {
+        let required = if public {
+            "playlist-modify-public"
         } else {
-            "user-library-read"
+            "playlist-modify-private"
         };
+        let scopes: Vec<_> = self
+            .tokens
+            .scope
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        scopes.contains(&required) && scopes.contains(&"playlist-read-private")
+    }
+    pub async fn login_with_options(
+        config: &Config,
+        discography: bool,
+        playlists: bool,
+    ) -> Result<Self> {
+        let mut scopes = String::from("user-library-read");
+        if discography {
+            scopes.push_str(" user-follow-read");
+        }
+        if playlists {
+            scopes
+                .push_str(" playlist-modify-private playlist-modify-public playlist-read-private");
+        }
         let client_id = config.client_id()?.to_owned();
         let redirect = config.redirect()?;
         let listener = TcpListener::bind(("127.0.0.1", redirect.port().unwrap()))
@@ -156,7 +181,7 @@ impl Auth {
             ("client_id", client_id.as_str()),
             ("response_type", "code"),
             ("redirect_uri", config.redirect_uri.as_str()),
-            ("scope", scopes),
+            ("scope", scopes.as_str()),
             ("code_challenge_method", "S256"),
             ("code_challenge", challenge(&verifier).as_str()),
             ("state", state.as_str()),
@@ -226,7 +251,7 @@ impl Auth {
                     .refresh_token
                     .context("Spotify não retornou refresh token")?,
                 expires_at: Utc::now().timestamp() + token.expires_in - 30,
-                scope: Some(token.scope.unwrap_or_else(|| scopes.to_owned())),
+                scope: Some(token.scope.unwrap_or_else(|| scopes.clone())),
             },
             client_id,
             http,
@@ -253,5 +278,17 @@ mod tests {
         assert!(!auth.can_read_followed());
         auth.tokens.scope = None;
         assert!(!auth.can_read_followed());
+    }
+    #[test]
+    fn playlist_permission_checks_visibility_and_private_read_scope() {
+        let mut auth = Auth::for_test();
+        assert!(!auth.can_create_playlists(false));
+        auth.tokens.scope = Some("playlist-modify-private playlist-read-private".into());
+        assert!(auth.can_create_playlists(false));
+        assert!(!auth.can_create_playlists(true));
+        auth.tokens.scope = Some("playlist-modify-public playlist-modify-private".into());
+        assert!(!auth.can_create_playlists(false));
+        auth.tokens.scope = Some("playlist-modify-public playlist-read-private".into());
+        assert!(auth.can_create_playlists(true));
     }
 }

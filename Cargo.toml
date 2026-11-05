@@ -1,9 +1,9 @@
 [package]
 name = "spotify-library-sync"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
-description = "Resumable, read-only Spotify library synchronization to SQLite"
+description = "Resumable Spotify library synchronization, offline queries and local playlist selection"
 
 [[bin]]
 name = "spotify-sync"

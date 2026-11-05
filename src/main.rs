@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use spotify_library_sync::{
     auth::Auth,
     config::Config,
-    database, discography,
+    database, discography, playlist,
     spotify::{Api, Spotify},
     sync,
 };
@@ -14,6 +14,7 @@ use sqlx::{
     QueryBuilder, Row, Sqlite,
 };
 use std::fs::OpenOptions;
+mod menu;
 
 #[derive(Parser)]
 #[command(
@@ -24,7 +25,7 @@ struct Cli {
     #[command(flatten)]
     config: Config,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -33,11 +34,19 @@ enum Command {
         /// Também autorizar a leitura dos artistas seguidos.
         #[arg(long)]
         discography: bool,
+        /// Autorizar criação e retomada de playlists.
+        #[arg(long)]
+        playlists: bool,
     },
     /// Importar o catálogo dos artistas que você segue.
     Discography {
         #[command(subcommand)]
         command: DiscographyCommand,
+    },
+    /// Selecionar no SQLite e criar playlists no Spotify.
+    Playlist {
+        #[command(subcommand)]
+        command: PlaylistCommand,
     },
     /// Remover credenciais locais.
     Logout,
@@ -96,6 +105,43 @@ enum Command {
         #[command(flatten)]
         filters: Filters,
     },
+}
+#[derive(Subcommand)]
+enum PlaylistCommand {
+    /// Só após conferir no Spotify que uma criação incerta NÃO foi aplicada.
+    RetryCreate {
+        #[arg(long)]
+        job: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long,default_value_t=1000,value_parser=clap::value_parser!(u32).range(5..=10000))]
+        request_budget: u32,
+    },
+    /// Prévia inteiramente local, sem credenciais ou internet.
+    Preview {
+        #[command(flatten)]
+        options: playlist::Options,
+    },
+    /// Mostrar a prévia e pedir confirmação antes de criar.
+    Create {
+        #[command(flatten)]
+        options: playlist::Options,
+        #[arg(long)]
+        yes: bool,
+        /// Aceitar uma base local incompleta ao usar --yes.
+        #[arg(long)]
+        allow_incomplete: bool,
+        #[arg(long,default_value_t=1000,value_parser=clap::value_parser!(u32).range(5..=10000))]
+        request_budget: u32,
+    },
+    /// Retomar a seleção congelada de um job, sem consultar novamente a biblioteca.
+    Resume {
+        #[arg(long)]
+        job: Option<String>,
+        #[arg(long,default_value_t=1000,value_parser=clap::value_parser!(u32).range(5..=10000))]
+        request_budget: u32,
+    },
+    Status,
 }
 #[derive(Subcommand)]
 enum DiscographyCommand {
@@ -177,6 +223,7 @@ fn print_json(value: &Value) -> Result<()> {
 }
 
 async fn execute(cli: Cli) -> Result<()> {
+    let command = cli.command.context("Escolha um comando")?;
     if let Some(parent) = cli
         .config
         .database
@@ -208,16 +255,25 @@ async fn execute(cli: Cli) -> Result<()> {
         .truncate(false)
         .open(absolute.with_extension("lockfile"))?;
     let disc_mutates = matches!(
-        &cli.command,
+        &command,
         Command::Discography {
             command: DiscographyCommand::Sync { .. }
                 | DiscographyCommand::Tracks { .. }
                 | DiscographyCommand::Restart
         }
     );
-    if disc_mutates
+    let playlist_mutates = matches!(
+        &command,
+        Command::Playlist {
+            command: PlaylistCommand::Create { .. }
+                | PlaylistCommand::Resume { .. }
+                | PlaylistCommand::RetryCreate { .. }
+        }
+    );
+    if playlist_mutates
+        || disc_mutates
         || matches!(
-            &cli.command,
+            &command,
             Command::Sync { .. }
                 | Command::CheckSaved { .. }
                 | Command::Login { .. }
@@ -228,9 +284,12 @@ async fn execute(cli: Cli) -> Result<()> {
             .context("Outra instância está usando este banco")?;
     }
     let mut db = database::open(&absolute).await?;
-    match cli.command {
-        Command::Login { discography } => {
-            let auth = Auth::login_with_discography(&cli.config, discography).await?;
+    match command {
+        Command::Login {
+            discography,
+            playlists,
+        } => {
+            let auth = Auth::login_with_options(&cli.config, discography, playlists).await?;
             let mut api = Spotify::new(auth, cli.config.request_interval_ms)?;
             let profile = match api.get("/me", None).await {
                 Ok(profile) => profile,
@@ -245,6 +304,100 @@ async fn execute(cli: Cli) -> Result<()> {
             database::bind_account(&mut db, id).await?;
             api.auth.persist()?;
             println!("Autenticação concluída para {id}. Execute spotify-sync sync.");
+        }
+        Command::Playlist { command } => {
+            match command {
+                PlaylistCommand::RetryCreate {
+                    job,
+                    yes,
+                    request_budget,
+                } => {
+                    let row=sqlx::query("SELECT public FROM playlist_job WHERE id=? AND state='creating' AND playlist_id IS NULL").bind(&job).fetch_optional(&mut db).await?.context("Job não está em criação sem confirmação")?;
+                    println!("Confira no Spotify: esta opção pode criar uma segunda playlist se a primeira já existir.");
+                    if !yes && !menu::confirm("Confirma que a playlist anterior NÃO foi criada e deseja tentar novamente?")? {return Ok(());}
+                    let auth = Auth::load(&cli.config)?;
+                    if !auth.can_create_playlists(row.get::<i64, _>("public") == 1) {
+                        bail!("Execute login --discography --playlists");
+                    }
+                    sync::check_cooldown(&mut db).await?;
+                    sqlx::query("UPDATE playlist_job SET state='ready',last_error=NULL,updated_at=? WHERE id=?").bind(database::now()).bind(&job).execute(&mut db).await?;
+                    run_playlist(&mut db, &cli.config, auth, &job, request_budget).await?;
+                }
+
+                PlaylistCommand::Preview { options } => {
+                    let preview = playlist::preview(&mut db, &options).await?;
+                    print_json(&serde_json::to_value(preview)?)?;
+                }
+                PlaylistCommand::Status => print_json(&playlist::status(&mut db).await?)?,
+                PlaylistCommand::Create {
+                    options,
+                    yes,
+                    allow_incomplete,
+                    request_budget,
+                } => {
+                    let preview = playlist::preview(&mut db, &options).await?;
+                    println!(
+                        "\nNome: {}\nVisibilidade: {}\nMúsicas: {}",
+                        preview.name,
+                        if preview.public {
+                            "Pública"
+                        } else {
+                            "Privada"
+                        },
+                        preview.count
+                    );
+                    for warning in &preview.warnings {
+                        println!("Aviso: {warning}");
+                    }
+                    for track in preview.candidates.iter().take(10) {
+                        println!("  {}", track.name.as_deref().unwrap_or(&track.id));
+                    }
+                    if preview.count == 0 {
+                        println!("Nenhuma música encontrada. Nenhuma playlist criada.");
+                        return Ok(());
+                    }
+                    if yes && preview.incomplete && !allow_incomplete {
+                        bail!("Base incompleta. Confira os avisos e use --allow-incomplete para aceitar a seleção local parcial");
+                    }
+                    if !yes
+                        && !menu::confirm(
+                            "Criar esta playlist no Spotify usando somente estes dados locais?",
+                        )?
+                    {
+                        println!("Criação cancelada.");
+                        return Ok(());
+                    }
+                    let auth = Auth::load(&cli.config)?;
+                    if !auth.can_create_playlists(preview.public) {
+                        bail!(
+                            "Autorize playlists com spotify-sync login --discography --playlists"
+                        );
+                    }
+                    sync::check_cooldown(&mut db).await?;
+                    let job = playlist::freeze(&mut db, &options, &preview).await?;
+                    println!("Job salvo: {job}");
+                    run_playlist(&mut db, &cli.config, auth, &job, request_budget).await?;
+                }
+                PlaylistCommand::Resume {
+                    job,
+                    request_budget,
+                } => {
+                    let job=match job {Some(id)=>id,None=>sqlx::query_scalar::<_,String>("SELECT id FROM playlist_job WHERE state<>'completed' ORDER BY created_at DESC,id DESC LIMIT 1").fetch_optional(&mut db).await?.context("Nenhuma playlist pendente")?};
+                    let public: i64 =
+                        sqlx::query_scalar("SELECT public FROM playlist_job WHERE id=?")
+                            .bind(&job)
+                            .fetch_optional(&mut db)
+                            .await?
+                            .context("Job não encontrado")?;
+                    let auth = Auth::load(&cli.config)?;
+                    if !auth.can_create_playlists(public == 1) {
+                        bail!(
+                            "Autorize playlists com spotify-sync login --discography --playlists"
+                        );
+                    }
+                    run_playlist(&mut db, &cli.config, auth, &job, request_budget).await?;
+                }
+            }
         }
         Command::Discography { command } => match command {
             DiscographyCommand::Sync { options, resume } => {
@@ -450,6 +603,31 @@ async fn execute(cli: Cli) -> Result<()> {
     }
     Ok(())
 }
+async fn run_playlist(
+    db: &mut sqlx::SqliteConnection,
+    config: &Config,
+    auth: Auth,
+    job: &str,
+    request_budget: u32,
+) -> Result<()> {
+    sync::check_cooldown(db).await?;
+    let mut api = Spotify::new(auth, config.request_interval_ms)?;
+    api.set_budget(Some(request_budget));
+    let result = tokio::select! {
+        result=playlist::run(db,&mut api,job)=>Some(result),
+        signal=tokio::signal::ctrl_c()=>{signal?;None},
+    };
+    match result {
+        Some(Ok(summary)) => print_json(&summary)?,
+        Some(Err(error)) => {
+            playlist::record_error(db, job, &error).await?;
+            eprintln!("Continue com spotify-sync playlist resume --job {job}");
+            return Err(error);
+        }
+        None => println!("Playlist pausada. Continue com spotify-sync playlist resume --job {job}"),
+    }
+    Ok(())
+}
 async fn run_discography(
     db: &mut sqlx::SqliteConnection,
     config: &Config,
@@ -508,7 +686,13 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
-    if let Err(error) = execute(Cli::parse()).await {
+    let cli = Cli::parse();
+    let result = if cli.command.is_none() {
+        menu::run(cli.config).await
+    } else {
+        execute(cli).await
+    };
+    if let Err(error) = result {
         eprintln!("Erro: {error:#}");
         std::process::exit(1);
     }

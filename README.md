@@ -117,6 +117,54 @@ Na conferência, uma falha de rede também permite retomar seu próprio checkpoi
 
 `status` inclui `full_passes`, com `phase`, `imported_offset` e `verified_offset`. O terminal distingue “importação” de “conferência — importação preservada”. Isso não cria um snapshot no Spotify; uma biblioteca em alteração contínua ainda pode precisar de novas conferências. Um checkpoint já apagado por um executável anterior não pode ser recuperado apenas pelo número que apareceu no terminal.
 
+## Menu no CMD e criação de playlists (v0.4.0)
+
+Execute `spotify-sync` sem argumentos para abrir o menu interativo. No Windows, `abrir-terminal.cmd` abre o programa na pasta correta e mantém o CMD aberto. O menu oferece login, sincronização e retomada da biblioteca, discografias, status, estatísticas e criação/retomada de playlists. Os comandos anteriores continuam disponíveis para scripts.
+
+| Opção | Seleção local | Nome padrão do Spotifast |
+|---|---|---|
+| LSUA | Músicas curtidas cujo álbum principal não está salvo. | `LSUA - {período}` |
+| USSA | Faixas não curtidas vinculadas a pelo menos um álbum salvo. | `USSA - {período}` |
+
+**A seleção usa exclusivamente o SQLite.** Criar uma playlist não sincroniza a biblioteca, não consulta `contains`, não baixa metadados e não percorre artistas ou álbuns no Spotify. Dados ausentes não são buscados automaticamente. Faixas locais, explicitamente indisponíveis ou sem URI válida são excluídas; a seleção é deduplicada por identidade e URI. Não há agrupamento de gravações distintas por nome ou ISRC.
+
+O menu pede período, referência da data, nome e visibilidade. Aceita ano (`2026`), mês/ano (`02/2026`), data (`05/02/2026`) ou intervalo inclusivo; os comandos também aceitam datas ISO. Um único período abrange o ano, mês ou dia inteiro. Sem período, o sufixo é `All`. Os demais nomes seguem o Spotifast: `LSUA - 02-2026`, `USSA - 2025 to 2026` ou `USSA - Through 2026`.
+
+A referência padrão é a data de adição: data da curtida na LSUA e data de salvamento do álbum na USSA, em UTC. Também é possível filtrar pelo lançamento do álbum; datas de lançamento com precisão de ano ou mês representam intervalos que podem se sobrepor ao período escolhido. Nomes são editáveis e playlists começam privadas por padrão.
+
+Antes de criar, a prévia mostra quantidade, até dez músicas, estado da importação, cobertura e datas de atualização/reconciliação da base local. Na USSA também avisa sobre álbuns com faixas incompletas. A criação depende de confirmação, inclusive para aceitar a seleção local parcial. Uma seleção vazia não cria playlist nem job. O usuário pode sair e sincronizar separadamente antes de tentar novamente.
+
+Autorize as permissões novas pelo item de login do menu ou pelo comando:
+
+```bash
+spotify-sync login --discography --playlists
+```
+
+`--playlists` acrescenta `playlist-modify-private`, `playlist-modify-public` e `playlist-read-private`. O escopo de leitura de playlists permite conferir o envio após uma interrupção. O login normal continua solicitando apenas leitura da biblioteca; as flags são explícitas e precisam ser incluídas ao refazer uma autorização com essas funcionalidades.
+
+Também há comandos diretos:
+
+```bash
+# Prévia offline, sem credenciais ou internet; JSON com todas as candidatas.
+spotify-sync playlist preview --kind lsua --from 02/2026
+spotify-sync playlist preview --kind ussa --from 2025 --to 2026 --date-basis release
+# Prévia e confirmação interativa.
+spotify-sync playlist create --kind lsua
+# Para scripts: confirmação explícita; base incompleta exige a outra flag.
+spotify-sync playlist create --kind ussa --yes --allow-incomplete
+spotify-sync playlist status
+spotify-sync playlist resume
+spotify-sync playlist resume --job ID_DO_JOB --request-budget 1500
+```
+
+`--name` altera o nome e `--public` escolhe uma playlist pública. Antes do primeiro envio, o programa congela a seleção em um job SQLite, com ID, conta e URIs ordenadas. Retomadas usam essa seleção mesmo se a biblioteca local mudar. O perfil `/me` confere a conta antes de qualquer gravação. A API é usada para criar a playlist e enviar lotes de até 100 músicas; na retomada também pode ler suas playlists e os itens da playlist de destino para conferir uma resposta perdida. Essas leituras não atualizam os dados da biblioteca local.
+
+POSTs com falha de rede, HTTP 5xx ou resposta sem confirmação não são repetidos automaticamente. Se a criação ficou incerta, a retomada procura o marcador do job na descrição, sem criar outra playlist automaticamente. Se o marcador não for localizado, a execução pausa; após conferir manualmente que a playlist não existe, use `spotify-sync playlist retry-create --job ID_DO_JOB`. Esse comando pede confirmação e pode gerar outra playlist se a primeira existir; para scripts, `--yes` assume essa confirmação. Rejeições explícitas, como HTTP 403/429, permitem uma nova tentativa normal após resolver a causa/cooldown.
+
+Após um envio incerto, a retomada confere o prefixo remoto contra o plano congelado. Um lote já observado como enviado não é repetido. Conteúdo divergente ou lote parcialmente observado pausa a execução sem sobrescrever a playlist. Evite editar a playlist enquanto o job estiver pendente. A API não oferece uma transação única junto com SQLite; visibilidade atrasada ou alterações concorrentes no Spotify impedem uma garantia absoluta de envio exatamente uma vez.
+
+O orçamento padrão é de 1.000 tentativas HTTP por invocação de criação/retomada, incluindo perfil, conferência, POSTs e retries de leituras. Aceita `--request-budget` entre 5 e 10.000. Uma conferência de playlist grande também consome esse limite; aumente-o se a retomada pausar antes de terminar a conferência. Intervalo entre chamadas, cooldown global, lock entre processos e Ctrl+C são respeitados. Fechar o programa não apaga os checkpoints; nenhuma execução continua em segundo plano.
+
 ## Discografias dos artistas seguidos (v0.3.0)
 
 ```bash
@@ -197,6 +245,8 @@ Flags explícitas de orçamento podem aumentar ou reduzir o limite numa retomada
 - `src/sync.rs`: modo incremental, referências congeladas, publicação por coleção, orçamentos, status e confirmação direcionada.
 - `src/legacy_sync.rs`: compatibilidade com modos completos e jobs v0.1.0.
 - `src/full_scan.rs`: importação e conferência completas com checkpoints independentes e busca de referências na retomada.
+- `src/playlist.rs`: seleção exclusivamente local, filtros de período, envio e recuperação de playlists.
+- `src/menu.rs`: menu e confirmações pelo terminal.
 - `src/discography.rs`: filas de artistas seguidos, cobertura de lançamentos, cache compartilhado e orçamentos de discografia.
 - `src/spotify.rs`: transporte, paginação, query tipada, quotas e retries.
 - `src/database.rs`: catálogo, JSON original, vínculos e reconciliação completa protegida contra uso incremental.
@@ -229,3 +279,7 @@ O workflow testa e compila Linux, Windows e macOS e disponibiliza ZIPs nos artef
 - [Artistas seguidos](https://developer.spotify.com/documentation/web-api/reference/get-followed)
 - [Lançamentos do artista](https://developer.spotify.com/documentation/web-api/reference/get-an-artists-albums)
 - [Faixas do álbum](https://developer.spotify.com/documentation/web-api/reference/get-an-albums-tracks)
+
+- [Criação de playlists](https://developer.spotify.com/documentation/web-api/reference/create-playlist)
+- [Adicionar itens à playlist](https://developer.spotify.com/documentation/web-api/reference/add-items-to-playlist)
+- [Conferir itens da playlist](https://developer.spotify.com/documentation/web-api/reference/get-playlists-items)

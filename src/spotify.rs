@@ -17,6 +17,10 @@ pub struct Paused {
 }
 
 #[derive(Debug, Error)]
+#[error("Gravação rejeitada antes de ser aplicada")]
+pub struct WriteRejected;
+
+#[derive(Debug, Error)]
 #[error("Orçamento de requisições esgotado; progresso preservado. Continue com sync --resume ou aumente o orçamento explicitamente.")]
 pub struct BudgetExhausted;
 
@@ -145,7 +149,26 @@ pub fn quota_exceeded(body: &Value) -> bool {
 }
 
 impl Spotify {
-    async fn request(&mut self, path: &str, parameters: &[(&str, String)]) -> Result<Value> {
+    pub(crate) async fn write_request(&mut self, path: &str, body: &Value) -> Result<Value> {
+        self.request_method(reqwest::Method::POST, path, &[], Some(body))
+            .await
+    }
+    pub(crate) async fn request(
+        &mut self,
+        path: &str,
+        parameters: &[(&str, String)],
+    ) -> Result<Value> {
+        self.request_method(reqwest::Method::GET, path, parameters, None)
+            .await
+    }
+    async fn request_method(
+        &mut self,
+        method: reqwest::Method,
+        path: &str,
+        parameters: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        let writing = method != reqwest::Method::GET;
         // Never follow API-supplied URLs with Authorization credentials.
         if !path.starts_with('/')
             || path.contains("://")
@@ -171,15 +194,24 @@ impl Spotify {
             self.last_request = Some(Instant::now());
             let mut request = self
                 .http
-                .get(format!("{}{path}", self.base_url))
+                .request(method.clone(), format!("{}{path}", self.base_url))
                 .bearer_auth(token);
             request = request.query(parameters);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
             let response = request.send().await;
             if let Ok(response) = response {
                 let status = response.status();
                 if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
                     refreshed = true;
-                    self.auth.refresh().await?;
+                    if let Err(error) = self.auth.refresh().await {
+                        return Err(if writing {
+                            error.context(WriteRejected)
+                        } else {
+                            error
+                        });
+                    }
                     self.count(true).await?;
                     continue;
                 }
@@ -192,6 +224,9 @@ impl Spotify {
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(_) => {
+                        if writing {
+                            bail!("Resposta da gravação não recebida; resultado incerto. Retome a playlist para conferir antes de reenviar");
+                        }
                         if attempt == 4 {
                             bail!("Falha de leitura da resposta Spotify após 5 tentativas");
                         }
@@ -209,16 +244,29 @@ impl Spotify {
                     let retry_at = Utc::now().checked_add_signed(
                         chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::days(1)),
                     );
-                    return Err(Paused { message: if quota {
+                    let error:anyhow::Error=Paused { message: if quota {
                         "QUOTA_EXCEEDED: sincronização pausada; retome posteriormente com sync --resume".into()
-                    } else { format!("HTTP 429: aguarde pelo menos {} segundos e execute sync --resume", wait.as_secs()) }, retry_at }.into());
+                    } else { format!("HTTP 429: aguarde pelo menos {} segundos e execute sync --resume", wait.as_secs()) }, retry_at }.into();
+                    return Err(if writing && !status.is_success() {
+                        error.context(WriteRejected)
+                    } else {
+                        error
+                    });
                 }
                 if status.is_success() {
                     return parsed.context("Resposta Spotify não contém JSON válido");
                 }
                 if !status.is_server_error() {
-                    bail!("Spotify retornou HTTP {status}; verifique as permissões do aplicativo e execute login se necessário");
+                    let error=anyhow::anyhow!("Spotify retornou HTTP {status}; verifique as permissões do aplicativo e execute login se necessário");
+                    return Err(if writing {
+                        error.context(WriteRejected)
+                    } else {
+                        error
+                    });
                 }
+            }
+            if writing {
+                bail!("Gravação sem confirmação (rede/HTTP 5xx); resultado incerto. Retome a playlist para conferir antes de reenviar");
             }
             if attempt == 4 {
                 bail!("Spotify indisponível após 5 tentativas; checkpoint preservado");
@@ -502,5 +550,117 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("307"));
         handle.await.unwrap();
+    }
+    async fn read_post_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut data = Vec::new();
+        let header_end;
+        loop {
+            let mut buf = [0; 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buf[..n]);
+            if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = i + 4;
+                break;
+            }
+        }
+        let header = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+        let length: usize = header
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        while data.len() < header_end + length {
+            let mut buf = [0; 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buf[..n]);
+        }
+        data
+    }
+    #[tokio::test]
+    async fn playlist_posts_use_current_routes_json_and_never_repeat_uncertain_writes() {
+        use crate::playlist::PlaylistApi;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for (path, reply) in [
+                ("/me/playlists", r#"{"id":"newPlaylist"}"#),
+                (
+                    "/playlists/newPlaylist/items",
+                    r#"{"snapshot_id":"snapshot"}"#,
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let data = read_post_request(&mut socket).await;
+                let header_end = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let header = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+                assert!(header.starts_with(&format!("post {} ", path.to_ascii_lowercase())));
+                assert!(header.contains("authorization: bearer test-token"));
+                let length = data.len() - header_end;
+                let body: Value =
+                    serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
+                if path == "/me/playlists" {
+                    assert_eq!(body["name"], "LSUA - All");
+                    assert_eq!(body["public"], false);
+                } else {
+                    assert_eq!(body["uris"], serde_json::json!(["spotify:track:abc"]));
+                }
+                let response=format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut api = Spotify::new(Auth::for_test(), 0).unwrap();
+        api.base_url = base;
+        api.create_playlist("LSUA - All", false, "job")
+            .await
+            .unwrap();
+        api.append_playlist("newPlaylist", &["spotify:track:abc".into()])
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert!(api
+            .append_playlist("bad/id", &["spotify:track:abc".into()])
+            .await
+            .is_err());
+        assert_eq!(api.attempt_count(), 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        api.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_post_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        assert!(api
+            .create_playlist("USSA - All", false, "job")
+            .await
+            .is_err());
+        task.await.unwrap();
+        assert_eq!(
+            api.attempt_count(),
+            3,
+            "POST must never retry automatically after HTTP 5xx"
+        );
+    }
+    #[tokio::test]
+    async fn rejected_playlist_write_retains_quota_type_and_never_retries() {
+        use crate::playlist::PlaylistApi;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut api = Spotify::new(Auth::for_test(), 0).unwrap();
+        api.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_post_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 123\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let error = api
+            .create_playlist("LSUA - All", false, "job")
+            .await
+            .unwrap_err();
+        assert!(error.is::<Paused>());
+        assert!(error.is::<WriteRejected>());
+        assert_eq!(api.attempt_count(), 1);
+        task.await.unwrap();
     }
 }

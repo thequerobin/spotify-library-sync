@@ -1,25 +1,25 @@
-# Validação — v0.3.0
+# Validação — v0.4.0
 
 Data: 05/11/2026. Ambiente local: Linux x86_64, Rust 1.99.1.
 
 - `cargo fmt -- --check`: aprovado.
 - `cargo clippy --locked --all-targets -- -D warnings`: aprovado, sem avisos.
-- `cargo test --locked --all-targets`: **69 testes**, sem falhas.
+- `cargo test --locked --all-targets`: **90 testes**, sem falhas.
 - `cargo build --release --locked`: compilação Linux aprovada.
 - `cargo build --release --locked --target x86_64-pc-windows-gnu`: compilação Windows x64 aprovada por cross-compilation com MinGW.
 - Executável Windows: formato PE32+ x86-64 e imports de DLLs inspecionados; somente bibliotecas do sistema.
 - Smoke test do release Linux: versão, ajuda, status e consultas locais, sem credenciais.
-- Banco criado por release: sete migrations aplicadas, `PRAGMA integrity_check` igual a `ok`.
+- Banco criado por release: oito migrations aplicadas, `PRAGMA integrity_check` igual a `ok`.
 
 ## Cenários cobertos
 
-### Transporte HTTP — 7 testes
+### Transporte HTTP — 9 testes
 
-429 sem JSON com Retry-After; QUOTA_EXCEEDED em 403; retry de 503 com HTML; bloqueio de redirect de credenciais; orçamento limitando retries reais; query tipada e codificada de `contains`; parâmetros reais de paginação, mercado e grupos para os endpoints de discografia.
+429 sem JSON com Retry-After; QUOTA_EXCEEDED em 403; retry de 503 com HTML; bloqueio de redirect de credenciais; orçamento limitando retries reais; query tipada e codificada de `contains`; parâmetros reais de paginação, mercado e grupos para os endpoints de discografia; POSTs JSON nos endpoints atuais de playlists sem retry de resultado incerto; HTTP 429 em gravação com tipo de quota preservado.
 
-### CLI — 2 testes
+### CLI — 4 testes
 
-Consultas offline com datas, artista, parâmetros vinculados e paginação; lock entre processos preservando a disponibilidade de status.
+Consultas offline com datas, artista, parâmetros vinculados e paginação; lock entre processos preservando a disponibilidade de status; menu sem argumentos, opção inválida e EOF; prévia offline e cancelamento antes de autenticação, sem criar job; criação por script exige aceitar uma base incompleta.
 
 ### Incremental e migração — 16 testes
 
@@ -52,6 +52,12 @@ Dezenove cenários de integração: apenas artistas seguidos; álbuns compartilh
 
 Dois testes de autenticação cobrem a leitura de tokens antigos sem o campo de escopo e a verificação exata da permissão `user-follow-read`. A autorização real continua dependendo da conta pessoal.
 
+### Playlists e permissões — 17 testes
+
+Dezesseis cenários de seleção e execução: LSUA por álbum principal; USSA usando todas as associações com álbuns salvos; deduplicação; faixas locais, indisponíveis e sem URI; períodos, datas UTC, lançamento com precisão parcial e nomes do Spotifast; avisos de base/álbuns incompletos; seleção vazia e nome inválido; envio em lotes de 100 sem ler a biblioteca remota nem alterar estados salvos; retomada após lote aplicado ou não aplicado; seleção congelada persistindo após reabrir SQLite; recuperação de criação por marcador; criação incerta não localizada sem recriação automática; rejeição explícita permitindo retomar; edição externa e lote parcial bloqueando reenvio; isolamento de conta; cooldown global e limite HTTP com avanço na retomada.
+
+Um teste adicional de autenticação confere as permissões de criação por visibilidade e a leitura privada necessária para recuperação.
+
 ## Limitações da validação local
 
 O login real e a leitura da conta pessoal precisam de Client ID e autorização no navegador. Os testes usam dados simulados e um servidor HTTP local. O executável Windows foi compilado, mas não executado em uma sessão Windows neste ambiente. O workflow do GitHub executa testes nativos e builds em Linux, Windows e macOS; seu resultado deve ser consultado separadamente nos Actions.
@@ -59,3 +65,5 @@ O login real e a leitura da conta pessoal precisam de Client ID e autorização 
 O incremental é uma heurística de cobertura recente. Os testes não transformam a paginação do Spotify em um snapshot nem garantem detectar alterações antigas fora das páginas consultadas.
 
 A atualização recente de discografias também é heurística; a cobertura completa da listagem exige percorrê-la até o fim. O teste com 1.000 artistas usa respostas simuladas e não constitui um benchmark da quota ou da latência real do Spotify.
+
+A criação real de playlists não foi executada na conta pessoal. Respostas simuladas e servidor HTTP local verificam o protocolo; atraso de visibilidade e edições concorrentes não permitem provar envio exatamente uma vez no serviço remoto. A recuperação verifica a playlist, não os estados de curtida/salvamento: a seleção permanece estritamente local.
