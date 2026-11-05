@@ -65,6 +65,8 @@ Não há segunda passagem integral no modo incremental. Quando necessário, há 
 
 A API não documenta um filtro `since` nem garante uma ordenação temporal nesses endpoints. A parada antecipada é uma heurística sobre a ordem observada. **A cobertura é da janela recente:** alterações antigas fora dela podem não aparecer. O programa não anuncia sincronização exata de toda a biblioteca nesse modo. Uma ordem incompatível entre itens sem mudança de data reconhecida pausa a coleta com cobertura inconclusiva; não dispara um full automático.
 
+Uma pausa por ordem incompatível mostra a coleção, o offset da página, o ID, a data recebida e a data anterior usada na comparação, ambas em UTC. O diagnóstico também distingue um ID ausente da referência congelada de um ID confirmado cuja data não mudou. Guarde essas linhas para investigar a causa antes de repetir a execução; elas não indicam que uma reconciliação completa foi iniciada.
+
 ### Estados salvos, remoções e consultas
 
 Uma música curtida é independente de seu álbum estar salvo. Músicas vindas de álbuns não são automaticamente curtidas. O catálogo conserva itens removidos, com o estado salvo atualizado somente após confirmação.

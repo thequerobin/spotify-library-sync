@@ -365,7 +365,24 @@ async fn incremental_collection<A: Api>(
             let date_changed = baseline.is_some() && !unchanged;
             if !date_changed {
                 if last.as_ref().is_some_and(|old| date > *old) {
-                    return Err(WorkPaused{reason:"ordering_inconclusive",message:"Ordem da janela recente incompatível com adições no início. Estados preservados; use --reconcile para uma verificação completa explícita.".into()}.into());
+                    let collection = if kind == "track" {
+                        "músicas curtidas"
+                    } else {
+                        "álbuns salvos"
+                    };
+                    let reference = if unchanged {
+                        "ID confirmado, com a mesma data na referência local"
+                    } else {
+                        "ID ausente da referência de itens salvos desta sincronização"
+                    };
+                    return Err(WorkPaused {
+                        reason: "ordering_inconclusive",
+                        message: format!(
+                            "Ordem da janela recente incompatível com adições no início.\nColeção: {collection}\nOffset da página: {offset}\nID: {id}\nData recebida (UTC): {date}\nData anterior usada na comparação (UTC): {}\nReferência: {reference}.\nEstados preservados. Este aviso não inicia uma reconciliação completa. Guarde este diagnóstico antes de tentar novamente.",
+                            last.as_deref().unwrap_or_default()
+                        ),
+                    }
+                    .into());
                 }
                 last = Some(date.clone());
             }

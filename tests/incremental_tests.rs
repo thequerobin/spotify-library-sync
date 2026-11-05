@@ -493,6 +493,13 @@ async fn unknown_item_out_of_order_never_publishes_or_advances_frontier() -> Res
         e.downcast_ref::<WorkPaused>().unwrap().reason,
         "ordering_inconclusive"
     );
+    let diagnostic = e.to_string();
+    assert!(diagnostic.contains("Coleção: músicas curtidas"));
+    assert!(diagnostic.contains("Offset da página: 0"));
+    assert!(diagnostic.contains("ID: UnknownOutOfOrder"));
+    assert!(diagnostic.contains(&format!("Data recebida (UTC): {NEW}")));
+    assert!(diagnostic.contains(&format!("Data anterior usada na comparação (UTC): {OLD}")));
+    assert!(diagnostic.contains("ID ausente da referência"));
     assert_eq!(
         count(
             &mut db,
@@ -508,6 +515,37 @@ async fn unknown_item_out_of_order_never_publishes_or_advances_frontier() -> Res
     assert_eq!(
         count(&mut db, "SELECT COUNT(*) FROM musica WHERE is_saved=1").await?,
         150
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_album_out_of_order_reports_collection_and_baseline_classification() -> Result<()>
+{
+    let (_dir, mut db) = setup(0, 150).await?;
+    let mut api = Library::new(0, 150);
+    api.albums[10]["added_at"] = json!(NEW);
+    sqlx::query("UPDATE album SET saved_at=? WHERE id='A000010'")
+        .bind(NEW)
+        .execute(&mut db)
+        .await?;
+    let job = sync::prepare_sync(&mut db, false, &Options::default()).await?;
+    let error = sync::run(&mut db, &mut api, &job, 30).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<WorkPaused>().unwrap().reason,
+        "ordering_inconclusive"
+    );
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("Coleção: álbuns salvos"));
+    assert!(diagnostic.contains("ID: A000010"));
+    assert!(diagnostic.contains("ID confirmado, com a mesma data"));
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT next_offset FROM sync_scope WHERE collection='album'"
+        )
+        .await?,
+        0
     );
     Ok(())
 }
